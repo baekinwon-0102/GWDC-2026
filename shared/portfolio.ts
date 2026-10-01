@@ -15,7 +15,11 @@ export function buildPortfolioPlans(needs: UserNeeds, inputs: MainnetInputs, now
   if (held.length <= 1) return buildMainnetPlans(needs, inputs, now);
 
   const trxPerUsdt = inputs.costBasis?.trxPerUsdt ? new Decimal(inputs.costBasis.trxPerUsdt) : undefined;
-  const toUsdt = (asset: string, v: Decimal): Decimal | undefined => (asset === "USDT" ? v : trxPerUsdt && trxPerUsdt.gt(0) ? v.div(trxPerUsdt) : undefined);
+  // USDD는 JustLend 오라클의 USDD·USDT 가격 비율(trxPerUsdd ÷ trxPerUsdt)로 환산, 없으면 PSM 기준 1:1
+  const trxPerUsdd = inputs.costBasis?.trxPerUsdd ? new Decimal(inputs.costBasis.trxPerUsdd) : undefined;
+  const usddPx = trxPerUsdd && trxPerUsdt && trxPerUsdt.gt(0) ? trxPerUsdd.div(trxPerUsdt) : new Decimal(1);
+  const toUsdt = (asset: string, v: Decimal): Decimal | undefined =>
+    asset === "USDT" ? v : asset === "USDD" ? v.mul(usddPx) : trxPerUsdt && trxPerUsdt.gt(0) ? v.div(trxPerUsdt) : undefined;
 
   const parts: PortfolioPart[] = held.map((h) => {
     const r = buildMainnetPlans(needsForHolding(needs, h), inputs, now, `m-${h.asset}`);

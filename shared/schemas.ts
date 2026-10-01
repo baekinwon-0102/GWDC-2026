@@ -39,7 +39,7 @@ export const Expense = z.object({
 });
 export type Expense = z.infer<typeof Expense>;
 
-export const HoldingAsset = z.enum(["USDT", "TRX"]);
+export const HoldingAsset = z.enum(["USDT", "TRX", "USDD"]);
 export const Holding = z.object({ asset: HoldingAsset, amount: DecimalString });
 export type Holding = z.infer<typeof Holding>;
 
@@ -58,6 +58,10 @@ export const UserNeeds = z.object({
   bufferAmount: DecimalString.optional(),
   riskProfile: RiskProfile.optional(),
   acceptUsddRisk: z.boolean().optional(),
+  /** 비용 가정: Energy 조달 방식 (기본 소각) */
+  energySource: z.enum(["burn", "stake", "rent"]).optional(),
+  /** 비용 가정: 거래 Energy 기준 (기본 실측 최대값) */
+  costBasisMode: z.enum(["max", "median", "typical"]).optional(),
   timezone: z.literal("Asia/Seoul"),
   version: z.number().int().nonnegative(),
 });
@@ -65,11 +69,11 @@ export type UserNeeds = z.infer<typeof UserNeeds>;
 
 /** LLM(또는 템플릿 파서)이 돌려주는 추출 결과. 명시된 정보만 채운다. */
 export const NeedsPatch = z.object({
-  /** 보유 자산 종류 (Mainnet: USDT 또는 TRX) */
-  asset: z.enum(["USDT", "TRX"]).nullish(),
+  /** 보유 자산 종류 (Mainnet: USDT·TRX·USDD) */
+  asset: z.enum(["USDT", "TRX", "USDD"]).nullish(),
   amount: DecimalString.nullish(),
   /** 여러 자산을 말하면 전체 보유 목록 ("USDT 5,000과 TRX 20,000") */
-  holdings: z.array(z.object({ asset: z.enum(["USDT", "TRX"]), amount: DecimalString })).max(4).nullish(),
+  holdings: z.array(z.object({ asset: z.enum(["USDT", "TRX", "USDD"]), amount: DecimalString })).max(4).nullish(),
   durationDays: z.number().int().positive().max(3650).nullish(),
   endDate: IsoDate.nullish(),
   expenses: z
@@ -192,13 +196,22 @@ export const CostBasis = z.object({
   bandwidthFeeSun: z.number(),
   /** 1 USDT가 몇 TRX인지 (TRX 비용을 USDT로 환산할 근거). 없으면 순수익 산정 불가 */
   trxPerUsdt: DecimalString.optional(),
+  /** 1 USDD가 몇 TRX인지 (USDD 보유자의 비용 환산). JustLend 오라클의 USDD·USDT 달러 가격 비율로 구한다 */
+  trxPerUsdd: DecimalString.optional(),
   /** PSM 전환 Energy: 최근 성공 거래의 실측 최대값 */
-  psmEnergy: z.object({ sell: z.number(), buy: z.number(), sampleSize: z.number(), bandwidth: z.object({ sell: z.number(), buy: z.number() }).optional() }).optional(),
+  psmEnergy: z
+    .object({ sell: z.number(), buy: z.number(), sampleSize: z.number(), bandwidth: z.object({ sell: z.number(), buy: z.number() }).optional(), median: z.object({ sell: z.number(), buy: z.number() }).optional() })
+    .optional(),
   /** Mainnet jToken 예치·인출: 최근 성공 거래의 실측 최대 Energy·대역폭 (인출 = redeem·redeemUnderlying 중 큰 값) */
   jTokenCosts: z
     .record(
       z.string(),
-      z.object({ supply: z.object({ energy: z.number(), bandwidth: z.number() }), withdraw: z.object({ energy: z.number(), bandwidth: z.number() }), sampleSize: z.number() }),
+      z.object({
+        supply: z.object({ energy: z.number(), bandwidth: z.number() }),
+        withdraw: z.object({ energy: z.number(), bandwidth: z.number() }),
+        sampleSize: z.number(),
+        median: z.object({ supply: z.object({ energy: z.number(), bandwidth: z.number() }), withdraw: z.object({ energy: z.number(), bandwidth: z.number() }) }).optional(),
+      }),
     )
     .optional(),
   /** Nile jTRX 거래 Energy: 최근 성공 거래의 실측 최대값 */
@@ -209,6 +222,23 @@ export const CostBasis = z.object({
       redeemUnderlying: z.number(),
       sampleSize: z.number(),
       bandwidth: z.object({ mint: z.number(), redeem: z.number(), redeemUnderlying: z.number() }).optional(),
+      median: z.object({ mint: z.number(), redeem: z.number(), redeemUnderlying: z.number() }).optional(),
+    })
+    .optional(),
+  /** 비용 기준: max = 실측 최대값(기본, 보수적), median = 실측 중앙값, typical = 공식 일반값(JustLend MCP) */
+  costMode: z.enum(["max", "median", "typical"]).optional(),
+  /**
+   * Energy 조달 방식. burn = TRX 소각(getEnergyFee), stake = Energy용으로 스테이킹해 둔 TRX로 충당(소각 없음),
+   * rent = JustLend Energy 대여(날짜별로 필요한 Energy를 1시간 빌림)
+   */
+  energyMode: z
+    .object({
+      mode: z.enum(["burn", "stake", "rent"]),
+      burnFeeSun: z.number(),
+      /** 스테이킹 1 TRX당 하루 Energy (TotalEnergyLimit ÷ TotalEnergyWeight) */
+      energyStakePerTrx: z.string().optional(),
+      rent: z.object({ ratePerTrxSec: z.string(), feeRatio: z.string(), minFeeTrx: z.string(), usageChargeRatio: z.string(), durationSec: z.number() }).optional(),
+      source: SourceMeta.optional(),
     })
     .optional(),
   source: SourceMeta,
@@ -324,13 +354,25 @@ export interface PlanningResult {
   /** 기회 탐색: 검토한 모든 상품과 분석 대상 여부·제외 사유 */
   screening?: ScreeningRow[];
   warnings: string[];
-  explanation: { text: string; source: "llm" | "template"; provider?: string; model?: string; fallbackReason?: string };
+  /** pending: AI 설명을 따로 만드는 중 (그동안 템플릿 설명을 보인다) */
+  explanation: { text: string; source: "llm" | "template"; provider?: string; model?: string; fallbackReason?: string; pending?: boolean };
   /** 여러 자산 보유: 자산별 결과와 합산. 최상위 필드는 첫 번째(대표) 자산의 결과와 같다 */
   portfolio?: PortfolioSummary;
+  /** 보유 자산과 다른 자산으로 내는 지출: 오늘 환전해 보유하는 필요량 */
+  conversions?: ExpenseConversion[];
+}
+
+export interface ExpenseConversion {
+  expenseId: string;
+  date: string;
+  need: { amount: string; asset: string };
+  pay: { amount: string; asset: string };
+  route: string;
+  costTrx: string;
 }
 
 export interface PortfolioPart {
-  asset: "USDT" | "TRX";
+  asset: "USDT" | "TRX" | "USDD";
   amount: string;
   /** 이 자산만 떼어 낸 요구사항으로 계산한 결과 (지출·여유액·위험 성향·인출일별 분산 모두 적용) */
   result: Omit<PlanningResult, "portfolio">;

@@ -1,6 +1,6 @@
 import Decimal from "decimal.js";
 import { TronWeb } from "tronweb";
-import { measureContractCosts, readWords } from "./tron-rpc";
+import { measureContractCosts, readWords, type MeasuredCost } from "./tron-rpc";
 import type { SwapMarket } from "../../shared/planning";
 import type { Chain } from "../../shared/schemas";
 
@@ -125,9 +125,14 @@ export async function fetchSwapMarket(chain: Chain = "mainnet", fallbackCosts?: 
   let costs = cc && Date.now() - cc.at < 10 * 60 * 1000 ? cc.value : undefined;
   let costNote = "";
   if (!costs) {
-    const m: Record<string, { energy: number; bandwidth: number; sampleSize: number } | undefined> = await measureContractCosts(chain, c.router, SWAP_SELECTORS, 200).catch(() => ({}));
+    const m: Record<string, MeasuredCost | undefined> = await measureContractCosts(chain, c.router, SWAP_SELECTORS, 200).catch(() => ({}));
     if (m.toTrx && m.toUsdt) {
-      costs = { toTrx: { energy: m.toTrx.energy, bandwidth: m.toTrx.bandwidth }, toUsdt: { energy: m.toUsdt.energy, bandwidth: m.toUsdt.bandwidth }, sampleSize: m.toTrx.sampleSize + m.toUsdt.sampleSize };
+      costs = {
+        toTrx: { energy: m.toTrx.energy, bandwidth: m.toTrx.bandwidth },
+        toUsdt: { energy: m.toUsdt.energy, bandwidth: m.toUsdt.bandwidth },
+        sampleSize: m.toTrx.sampleSize + m.toUsdt.sampleSize,
+        median: { toTrx: m.toTrx.median.energy, toUsdt: m.toUsdt.median.energy },
+      };
       costCache[chain] = { at: Date.now(), value: costs };
     } else if (fallbackCosts) {
       costs = fallbackCosts;

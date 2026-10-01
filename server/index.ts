@@ -5,7 +5,7 @@ import { createNim } from "./llm/nim";
 import { createBai } from "./llm/bai";
 import { compactForExplain, explanationIssues, LlmError, unknownNumbers, type LlmProvider } from "./llm/provider";
 import { templateExplain, templateExtract } from "./llm/template";
-import { cachedJtrxEnergy, getMainnetInputs, getNileInputs } from "./data/quotes";
+import { cachedJtrxEnergy, getMainnetInputs, getNileInputs, refreshMainnetInputs, refreshNileInputs } from "./data/quotes";
 import { measureStakingTxBandwidth, stakingPosition } from "./data/staking";
 import { computeNileAdjustment } from "../shared/adjust";
 import { replayPlan } from "../shared/replay";
@@ -14,6 +14,7 @@ import { chainFees, contractExists, isBase58Address, nileTxStatus, readUint, trx
 import { fetchJustLendCatalog, JUSTLEND, nileJtrxPosition } from "./data/justlend";
 import { runAgent } from "./agent/loop";
 import { buildNileCall } from "./data/nile-calls";
+import { withCostOptions } from "./data/energy";
 import { PreviousAnalysis, reevaluate } from "./agent/reevaluate";
 import type { ToolContext } from "./agent/tools";
 import { connectAll, mcpStatuses } from "./mcp/clients";
@@ -118,9 +119,11 @@ app.post("/api/plans", async (req, res) => {
   let base: Omit<PlanningResult, "explanation">;
   if (needs.chain === "mainnet") {
     const f = await getMainnetInputs();
+    // 비용 가정(비용 기준·Energy 조달 방식)을 입력에 적용한다
+    const c = await withCostOptions("mainnet", needs, f.inputs);
     // 여러 자산이면 자산마다 같은 계획 엔진을 돌린다 (한 자산이면 buildMainnetPlans와 같다)
-    base = buildPortfolioPlans(needs, f.inputs);
-    base.warnings.unshift(...f.failures);
+    base = buildPortfolioPlans(needs, c.inputs);
+    base.warnings.unshift(...f.failures, ...c.warnings);
   } else {
     const f = await getNileInputs();
     let walletBalanceTrx: string | undefined;
@@ -132,23 +135,52 @@ app.post("/api/plans", async (req, res) => {
         f.failures.push(`Nile 지갑 잔고 조회 실패: ${(e as Error).message}`);
       }
     }
-    base = buildNilePlans(needs, { ...f.inputs, walletBalanceTrx });
-    base.warnings.unshift(...f.failures);
+    const c = await withCostOptions("nile", needs, f.inputs);
+    base = buildNilePlans(needs, { ...c.inputs, walletBalanceTrx });
+    base.warnings.unshift(...f.failures, ...c.warnings);
   }
 
+  // 계획은 바로 돌려주고(템플릿 설명), AI 설명은 /api/explain에서 따로 만든다 (계산 0.02초 vs AI 설명 수 초).
+  // Nile 탭은 설명을 화면에 쓰지 않으므로 AI 설명을 만들지 않는다.
+  const wantsAi = needs.chain === "mainnet" && Boolean(provider());
+  if (wantsAi) {
+    explainCache.set(base.id, { at: Date.now(), base });
+    for (const [k, v] of explainCache) if (Date.now() - v.at > 10 * 60_000) explainCache.delete(k);
+  }
+  res.json(withTemplateExplanation(base, wantsAi) satisfies PlanningResult);
+});
+
+/** 서버가 계산한 결과만 설명한다 (브라우저가 보낸 계획은 쓰지 않음): 계산 결과를 id로 잠시 보관 */
+const explainCache = new Map<string, { at: number; base: Omit<PlanningResult, "explanation"> }>();
+
+function withTemplateExplanation(base: Omit<PlanningResult, "explanation">, pending: boolean): PlanningResult {
+  const reason = pending ? "AI 설명을 만드는 중입니다" : provider() ? "Nile 탭은 AI 설명을 쓰지 않음" : "LLM 키 미설정";
+  if (base.portfolio) {
+    for (const pt of base.portfolio.parts) pt.result.explanation = { text: templateExplain(pt.result), source: "template", fallbackReason: reason, pending };
+    const text = base.portfolio.parts.map((pt) => `[${pt.asset} ${pt.amount}] ${pt.result.explanation.text}`).join("\n\n");
+    return { ...base, explanation: { text, source: "template", fallbackReason: reason, pending } };
+  }
+  return { ...base, explanation: { text: templateExplain(base), source: "template", fallbackReason: reason, pending } };
+}
+
+app.post("/api/explain", async (req, res) => {
+  const id = z.object({ id: z.string().max(80) }).safeParse(req.body);
+  if (!id.success) return res.status(400).json({ error: "요청 형식이 올바르지 않습니다" });
+  const hit = explainCache.get(id.data.id);
+  if (!hit) return res.status(404).json({ error: "설명할 계산 결과가 없습니다 (10분이 지났거나 서버가 재시작됨)" });
+  const base = hit.base;
   if (base.portfolio) {
     // 자산별 설명을 각각 만들고(숫자 검증 포함), 대표 설명은 자산별 설명을 이어 붙인다
     const parts = base.portfolio.parts;
     const explained = await Promise.all(parts.map((pt) => explainBase(pt.result)));
-    parts.forEach((pt, i) => (pt.result.explanation = explained[i]));
     const text = parts.map((pt, i) => `[${pt.asset} ${pt.amount}] ${explained[i].text}`).join("\n\n");
     const allLlm = explained.every((e) => e.source === "llm");
     const explanation: PlanningResult["explanation"] = allLlm
       ? { text, source: "llm", provider: explained[0].provider, model: explained[0].model }
       : { text, source: "template", fallbackReason: explained.find((e) => e.fallbackReason)?.fallbackReason };
-    return res.json({ ...base, explanation } satisfies PlanningResult);
+    return res.json({ explanation, parts: explained });
   }
-  res.json({ ...base, explanation: await explainBase(base) } satisfies PlanningResult);
+  res.json({ explanation: await explainBase(base) });
 });
 
 /** LLM 설명 → 숫자·형식 검증 → 실패하면 템플릿 */
@@ -171,7 +203,7 @@ async function explainBase(base: Omit<PlanningResult, "explanation" | "portfolio
 
 // ------------------------------------------------------------------ market (시장 데이터 탭)
 app.get("/api/market", async (_req, res) => {
-  const [m, n] = await Promise.all([getMainnetInputs(true), getNileInputs()]);
+  const [m, n] = await Promise.all([getMainnetInputs(), getNileInputs()]);
   res.json({ mainnet: m, nile: n });
 });
 
@@ -339,7 +371,9 @@ app.post("/api/agent/run", async (req, res) => {
     const missing = missingFields(needs);
     const problems = inputProblems(needs);
     if (missing.length || problems.length) return res.status(422).json({ error: "확인되지 않은 입력이 있습니다", missing, problems });
-    const f = await getMainnetInputs();
+    const f0 = await getMainnetInputs();
+    const c = await withCostOptions("mainnet", needs, f0.inputs);
+    const f = { ...f0, inputs: c.inputs };
     ctx = {
       context, needs, inputs: f.inputs, failures: f.failures, mode: f.mode, now, previousRates,
       base: buildMainnetPlans(needs, f.inputs, now),
@@ -367,7 +401,8 @@ app.post("/api/agent/reevaluate", async (req, res) => {
   const { needs, previous } = body.data;
   if (missingFields(needs).length || inputProblems(needs).length) return res.status(422).json({ error: "확인되지 않은 입력이 있습니다" });
   const f = await getMainnetInputs(true);
-  res.json(await reevaluate(needs, previous, f.inputs, f.failures, provider()));
+  const c = await withCostOptions("mainnet", needs, f.inputs);
+  res.json(await reevaluate(needs, previous, c.inputs, f.failures, provider()));
 });
 
 // ------------------------------------------------------------------ 과거 재생 (P1 Tracking & Review, 시뮬레이션)
@@ -382,7 +417,7 @@ app.post("/api/replay", async (req, res) => {
     const f = await getMainnetInputs();
     const markets = f.inputs.markets ?? (await fetchMarketUniverse());
     // 서버가 자기 시세로 계획을 다시 계산한다 (브라우저가 보낸 계획은 쓰지 않음)
-    const plan = buildMainnetPlans(needs, f.inputs).plans.find((p) => p.key === planKey)!;
+    const plan = buildMainnetPlans(needs, (await withCostOptions("mainnet", needs, f.inputs)).inputs).plans.find((p) => p.key === planKey)!;
     res.json(replayPlan(plan, markets));
   } catch (e) {
     res.status(502).json({ error: `과거 재생 실패: ${redact((e as Error).message)}` });
@@ -419,8 +454,15 @@ app.listen(env.apiPort, "127.0.0.1", () => {
       .finally(() => {
         getMainnetInputs(true)
           .then((f) => console.log(`[warmup] Mainnet 시세 준비${f.failures.length ? ` (실패 ${f.failures.length}건)` : ""}`))
-          .catch(() => undefined);
+          .catch(() => undefined)
+          .finally(() => refreshNileInputs().then((f) => console.log(`[warmup] Nile 시세 준비${f.failures.length ? ` (실패 ${f.failures.length}건)` : ""}`)).catch(() => undefined));
         cachedJtrxEnergy().catch(() => undefined);
+        // 백그라운드 갱신: 사용자가 누를 때 기다리지 않도록 약 50초마다 미리 조회해 둔다 (Mainnet·Nile을 번갈아, 요청 제한을 넘지 않게)
+        let tick = 0;
+        setInterval(() => {
+          const job = tick++ % 2 === 0 ? refreshMainnetInputs() : refreshNileInputs();
+          job.catch(() => undefined);
+        }, 25_000).unref?.();
       });
   }
 });

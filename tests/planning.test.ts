@@ -59,9 +59,10 @@ describe("요구사항 상태", () => {
     const n: UserNeeds = { ...demoNeeds(TODAY), amount: "100" };
     expect(inputProblems(n).some((p) => p.includes("보다 큽니다"))).toBe(true);
   });
-  it("다른 자산 지출은 입력 제한으로 안내한다", () => {
+  it("다른 자산 지출은 USDT·TRX·USDD면 허용하고(환전해서 냄), 그 밖의 자산은 막는다", () => {
     const n: UserNeeds = { ...demoNeeds(TODAY), expenses: [{ id: "1", date: "2026-10-01", amount: "10", asset: "TRX" }] };
-    expect(inputProblems(n).length).toBe(1);
+    expect(inputProblems(n)).toEqual([]);
+    expect(inputProblems({ ...n, expenses: [{ id: "1", date: "2026-10-01", amount: "10", asset: "BTC" }] }).length).toBe(1);
   });
   it("입력이 바뀌면 버전이 올라간다 (확인 무효화 근거)", () => {
     const n = demoNeeds(TODAY);

@@ -126,10 +126,18 @@ export async function txInfo(chain: Chain, txId: string) {
 }
 
 export interface MeasuredCost {
+  /** 최대값 (보수적 기준) */
   energy: number;
   bandwidth: number;
   sampleSize: number;
+  /** 중앙값 (비용 기준을 "중앙값"으로 고를 때) */
+  median: { energy: number; bandwidth: number };
 }
+
+const medianOf = (xs: number[]) => {
+  const a = [...xs].sort((x, y) => x - y);
+  return a.length ? (a.length % 2 ? a[(a.length - 1) / 2] : Math.round((a[a.length / 2 - 1] + a[a.length / 2]) / 2)) : 0;
+};
 
 /**
  * 계약의 최근 성공 거래에서 메서드(선택자)별 Energy·대역폭 실측 최대값을 뽑는다.
@@ -141,16 +149,20 @@ export async function measureContractCosts(chain: Chain, contract: string, selec
     getJson<{ data?: any[] }>(chain, `/v1/accounts/${contract}/transactions?only_to=true&only_confirmed=true&limit=${limit}`),
     chainFees(chain),
   ]);
-  const out: Record<string, MeasuredCost> = {};
+  const samples: Record<string, { e: number[]; b: number[] }> = {};
   for (const t of j.data ?? []) {
     if (t?.ret?.[0]?.contractRet !== "SUCCESS") continue;
     const data: string = t?.raw_data?.contract?.[0]?.parameter?.value?.data ?? "";
     const name = Object.keys(selectors).find((k) => data.startsWith(selectors[k]));
     if (!name) continue;
     const bw = Number(t.net_usage ?? 0) || Math.round(Number(t.net_fee ?? 0) / fees.bandwidthFeeSun);
-    const cur = out[name] ?? { energy: 0, bandwidth: 0, sampleSize: 0 };
-    out[name] = { energy: Math.max(cur.energy, Number(t.energy_usage_total ?? 0)), bandwidth: Math.max(cur.bandwidth, bw), sampleSize: cur.sampleSize + 1 };
+    const cur = (samples[name] ??= { e: [], b: [] });
+    cur.e.push(Number(t.energy_usage_total ?? 0));
+    cur.b.push(bw);
   }
+  const out: Record<string, MeasuredCost> = {};
+  for (const [k, v] of Object.entries(samples))
+    out[k] = { energy: Math.max(...v.e), bandwidth: Math.max(...v.b), sampleSize: v.e.length, median: { energy: medianOf(v.e), bandwidth: medianOf(v.b) } };
   return out;
 }
 

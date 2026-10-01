@@ -137,6 +137,18 @@ USDD의 자체 수익 상품은 sUSDD(USDD 저축, ERC-4626)다. 공식 USDD MCP
 
 결론: TRON에는 배포되지 않아 계산하지 않고, 탐색 표에 "TRON 미배포"로 사유와 다른 체인 금리를 참고로 보인다. TRON에서 USDD로 수익을 내는 경로는 JustLend jUSDD 예치(계획 B)다. 같은 조회에서 Nile 등록부(`TRuw52wuVD61n1HB8b7V8d8sNPUfoUCj3w`)에 USDD PSM(`TEwUGMSAvbmzjxWoV8JWoSqvQm1A3AXs1V`)과 그 기초 USDT(`TZDnq7egPqzi7H4SXy1ABvwaVRvRTaVfJW`)가 있음을 확인했다. 이 USDT는 faucet이 없지만 USDD(구) PSM의 buyGem으로 얻을 수 있어, Nile에서도 B를 실행한다 (§5.4).
 
+### 3.9 Energy 조달 방식·비용 기준 (비용 가정)
+
+`server/data/energy.ts`, `shared/costmode.ts`. 사용자가 고른 가정을 입력에 적용한다 (계획 계산 코드는 같음).
+
+- **스테이킹**: 스테이킹 1 TRX당 하루 Energy = `TotalEnergyLimit ÷ TotalEnergyWeight` (`/wallet/getaccountresource`). Energy 소각 비용은 0으로 두고, 추천 계획의 하루 최대 Energy를 만들려면 Energy용으로 스테이킹해 둬야 하는 TRX를 경고로 보인다 (2026-09-30: 1 TRX당 약 9.7 Energy → jUSDT 예치 하루 21.6만 Energy에 약 2.2만 TRX).
+- **대여**: JustLend Energy 대여 시장 `TU2MJ5Veik1LRAgjeSzEdvmDYx7mefJZvd`(Nile `TSos1xxjqMrGKBxycVmtgrnFvv9M6FDFUX`)의 `_rentalRate(5만 TRX, 1)`·`_stableRate(1)` 중 큰 값(TRX당 초당), `feeRatio()`, `minFee()`, `usageChargeRatio()`, `rentPaused(1)`을 읽는다. 날짜별 Energy E마다 한 번: 위임 TRX = ⌈E ÷ 스테이킹 1 TRX당 Energy⌉, 비용 = 위임 TRX × 대여율 × 3,600초 + 위임 TRX × 대여율 × 86,400 × 사용분 차감률 + max(최소 수수료, 위임 TRX × 수수료율). 주소·계산식 출처: 공식 JustLend MCP `src/core/chains.ts`(strx.market)·`services/energy-rental.ts`(calculateRentalPrice), [JustLend 문서 Energy Rental](https://docs.justlend.org/getting_started/concepts/energy_rental/). 2026-09-30 값: 대여율 약 6.25e-9, 수수료율 0.008%, 최소 수수료 20 TRX, 사용분 차감 0.75일 → 한 번에 20 TRX 이상이라 소액·다회 거래에서는 소각보다 비쌀 수 있다.
+- **비용 기준**: 실측 최대값(기본) / 실측 중앙값(최근 성공 거래의 중앙값) / 공식 일반값(jToken은 JustLend MCP TYPICAL_RESOURCES, 일반값이 없는 PSM·교환은 중앙값).
+
+### 3.10 다른 자산 지출 환전
+
+`shared/fx.ts`. 보유 자산과 다른 자산(USDT·TRX·USDD)으로 내는 지출은 받고 싶은 양에서 필요한 투입량을 역산한다: V2 `in = R_in × out × 1000 ÷ ((R_out − out) × 997)`(단계마다, 6자리 올림), 브리지 PSM·USDD PSM은 tin/tout 수수료. 환전 거래비용(교환·승인·PSM, 소각 기준)을 더해 오늘 환전해 보유하는 것으로 지출 재원에 넣는다. 여러 자산이면 보유하지 않은 자산의 지출은 대표 자산에서 환전한다. Nile에서는 환전 필요량만 계산하고 환전 거래는 계획 실행과 별도다.
+
 ## 4. MCP
 
 ### 4.1 TronGrid 호스팅 MCP — 사용
@@ -195,6 +207,7 @@ AI 조사 에이전트(`server/agent/`)는 MCP가 아니라 앱 내부의 읽기
 
 ### 5.2 계획별 추가 근거
 
+- **USDD 보유자**: 평가 자산 USDD. 거래비용(TRX)은 `trxPerUsdd = trxPerUsdt × (jUSDD 기초자산 달러 가격 ÷ jUSDT 기초자산 달러 가격)`(JustLend 오라클)로 환산한다. A·A-2 = jUSDD 예치(채굴 보상은 기초자산 가격 비율이 1이라 USDD 그대로), B = USDD → PSM buyGem(tout) → USDT → jUSDT → 만기 PSM sellGem(tin) → USDD(PSM은 1:1이라 USDT 이자를 USDD 수익으로 보고 수수료는 전환 비용, 위험 등급 스테이블 전환), C = PSM → SunSwap → 스테이킹 → 역순(위험 등급 가격 변동), L = jUSDD 예치(검증 채굴 보상 포함)·PSM+교환 스테이킹·보유 조합. USDD만 보유하면 USDD 위험 동의를 묻지 않는다. 지출 환전: USDD → USDT는 PSM tout, USDD → TRX는 PSM + SunSwap 역산.
 - **여러 자산 보유** (`shared/portfolio.ts`): 대화("테더 5천개랑 트론 2만개")나 폼으로 USDT와 TRX를 함께 입력할 수 있다. 자산마다 그 자산으로 낼 지출만 떼어 내고(비상 여유액은 대표 자산에만) 같은 계획 엔진을 따로 돌린다 — 지출 재원 확보, 인출일별 구간, 위험 성향, 추천이 자산마다 적용된다. 합계는 JustLend 오라클 가격으로 USDT 환산하고, 추천 계획들을 합친 배분표(자산·넣을 곳·금액·전체 대비 비율)를 보인다. 보유하지 않은 자산의 지출이나 자산별 재원 부족은 입력 문제로 막는다. 자산 간 교환으로 지출을 충당하지는 않는다.
 - **보유 자산**: Mainnet 입력은 USDT, TRX 또는 둘 다. TRX 보유자는 A·A-2가 jTRX(`TE2RzoSV3wFK99w6J9UnnZ4vLfXYoxvRwP`, OpenAPI·공식 MCP 소스 주소 일치) 예치로 바뀌고 승인 단계가 없으며 비용은 TRX로 평가한다. B는 SunSwap V2로 TRX→USDT 교환 → PSM → jUSDD → 역순으로 계산한다(교환·PSM 손실은 전환 비용, 원금이 달러 자산이 되므로 위험 등급 "가격 변동", TRX 가격 −10%·+10%·+20% 스트레스). C는 교환이 없어 위험 등급 "보유 자산 그대로"로 계산한다. USDD 위험 질문은 모든 보유자에게 한다.
 - **계획 A (jUSDT 전액 예치)**: 승인 → 예치 → 만기 인출. 금리는 OpenAPI `supplyRate`(APY).
@@ -275,7 +288,7 @@ AI 조사 에이전트(`server/agent/`)는 MCP가 아니라 앱 내부의 읽기
 
 ## 7. 검증
 
-**자동 테스트** — `npm test`, 121개
+**자동 테스트** — `npm test`, 129개
 
 | 파일 | 개수 | 내용 |
 | --- | --- | --- |
@@ -283,7 +296,7 @@ AI 조사 에이전트(`server/agent/`)는 MCP가 아니라 앱 내부의 읽기
 | `tests/adjust-staking-rewards.test.ts` | 43 | 포지션 조정 판정·리밸런스, 보상 분리·가격 환산·캠페인 검증 조건, 실측 비용 반영, 계획 C(USDT 보유자 SunSwap 왕복·스트레스·가격 영향 한도), 교환 공식, 위험 성향, 기회 탐색, 과거 재생, 보유 자산 TRX, 인출일별 분산(USDT 보유자 스테이킹 구간 포함) |
 | `tests/agent.test.ts` | 23 | 도구 허용 목록·인자 검증, 동의 변경 차단, 최종 게이트(부적격·불일치 추천 불채택, 숫자 검증), 반복·단계 한도, 규칙 경로, 재평가 |
 | `tests/llm-and-mcp.test.ts` | 9 | LLM 응답 정규화·거부, 템플릿 추출, MCP 허용 목록, 설명 숫자·형식 검증 |
-| `tests/portfolio-nile.test.ts` | 19 | 여러 자산 입력 추출·수정·검증, 자산별 요구사항, 자산별 배분(지출 확보·인출일별 분산·추천)과 USDT 합계, 스테이킹 조정 판정, Nile 계획 ID 고유성, sUSDD 탐색 행, TRX 보유자 USDD 경로(직접 교환·브리지 PSM·성향 제외) |
+| `tests/portfolio-nile.test.ts` | 27 | 여러 자산 입력 추출·수정·검증, 자산별 요구사항, 자산별 배분(지출 확보·인출일별 분산·추천)과 USDT 합계, 스테이킹 조정 판정, Nile 계획 ID 고유성, sUSDD 탐색 행, TRX 보유자 USDD 경로(직접 교환·브리지 PSM·성향 제외) |
 | `tests/bai.test.ts` | 3 | Bank of AI 요청 형식, 400 재시도, 빈 응답 처리 |
 
 **외부 연결 진단** — `npm run doctor`: TronGrid Mainnet·Nile, JustLend OpenAPI, USDD PSM 온체인, PSM·Nile jTRX·Mainnet jToken 거래비용 실측, JustLend 채굴 보상, TRX 스테이킹 보상, Nile jTRX 계약, 선택한 LLM 공급자, MCP 허용 목록 거부 테스트, MCP 연결.

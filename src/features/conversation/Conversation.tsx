@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { Update } from "../../App";
-import { api } from "../../lib/api";
+import { api, fillExplanation } from "../../lib/api";
 import type { PersistedState } from "../../lib/storage";
 import { applyPatch, daysBetween, holdingsOf, inputProblems, missingFields, nextQuestion, riskLabel, summarizeNeeds } from "../../../shared/needs";
 import type { ChatMessage, NeedsPatch, UserNeeds } from "../../../shared/schemas";
@@ -52,7 +52,11 @@ export default function Conversation({
   }, [state.messages.length, busy]);
 
   const needs = state.needs;
-  const other = needs.asset === "USDT" ? "TRX" : "USDT";
+  // 추가 보유 자산 (대표 자산이 아닌 것 중 고름). 이미 목록에 있으면 그 자산
+  const others = (["USDT", "TRX", "USDD"] as const).filter((a) => a !== needs.asset);
+  const [otherPick, setOtherPick] = useState<(typeof others)[number]>();
+  const listed = holdingsOf(needs).find((h) => h.asset !== needs.asset)?.asset as (typeof others)[number] | undefined;
+  const other = otherPick && others.includes(otherPick) ? otherPick : listed ?? others[0];
   const missing = missingFields(needs);
   const problems = inputProblems(needs);
   const confirmed = state.convState === "confirmed" || state.convState === "comparing";
@@ -126,6 +130,7 @@ export default function Conversation({
         analyses: [...s.analyses, result],
         messages: [...s.messages, { role: "assistant", content: `요구사항 v${needs.version}을 확인했어요. 계획 비교 탭에서 A/B/보유 기준선을 비교해 보세요.` }],
       }));
+      fillExplanation(result, update);
       goPlans();
     } catch (e) {
       update((s) => ({ ...s, convState: "awaiting_confirmation", confirmedVersion: undefined }));
@@ -223,9 +228,10 @@ export default function Conversation({
             <div className="row" style={{ marginTop: 10, alignItems: "flex-end" }}>
               <label className="field">
                 보유 자산
-                <select value={needs.asset} onChange={(e) => patchForm({ asset: e.target.value as "USDT" | "TRX" })}>
+                <select value={needs.asset} onChange={(e) => patchForm({ asset: e.target.value as "USDT" | "TRX" | "USDD" })}>
                   <option value="USDT">USDT</option>
                   <option value="TRX">TRX</option>
+                  <option value="USDD">USDD</option>
                 </select>
               </label>
               <label className="field">
@@ -233,9 +239,19 @@ export default function Conversation({
                 <input defaultValue={needs.amount} key={`a${needs.version}`} onBlur={(e) => /^\d+(\.\d+)?$/.test(e.target.value) && patchForm({ amount: e.target.value })} />
               </label>
               <label className="field">
+                추가 보유 자산
+                <select value={other} onChange={(e) => setOtherPick(e.target.value as (typeof others)[number])}>
+                  {others.map((a) => (
+                    <option key={a} value={a}>
+                      {a}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
                 추가 보유 {other} (없으면 비움)
                 <input
-                  key={`o${needs.version}`}
+                  key={`o${needs.version}${other}`}
                   defaultValue={holdingsOf(needs).find((h) => h.asset === other)?.amount ?? ""}
                   onBlur={(e) => {
                     const v = e.target.value.trim();
@@ -306,7 +322,8 @@ function ExpenseForm({ assets, fallback, onAdd }: { assets: string[]; fallback: 
   const [days, setDays] = useState("7");
   const [amt, setAmt] = useState("200");
   const [asset, setAsset] = useState<string>();
-  const opts = assets.length ? assets : [fallback];
+  // 보유 자산을 먼저, 그다음 환전해서 낼 수 있는 자산 (USDT·TRX·USDD)
+  const opts = [...new Set([...(assets.length ? assets : [fallback]), "USDT", "TRX", "USDD"])];
   const cur = asset && opts.includes(asset) ? asset : opts[0];
   return (
     <div className="row" style={{ marginTop: 10, alignItems: "flex-end" }}>

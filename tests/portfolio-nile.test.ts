@@ -3,6 +3,7 @@ import { computeStakingAdjustment } from "../shared/adjust";
 import { addDays, applyPatch, emptyNeeds, holdingsOf, inputProblems, missingFields, needsForHolding } from "../shared/needs";
 import { templateExtract } from "../server/llm/template";
 import { buildMainnetPlans, buildNilePlans, swapOut, trxToUsdt, usdtToTrx, type SwapMarket } from "../shared/planning";
+import { applyCostOptions, rentalCostTrx } from "../shared/costmode";
 import { buildPortfolioPlans } from "../shared/portfolio";
 import { buildScreening } from "../shared/screening";
 import { Decimal } from "../shared/units";
@@ -71,9 +72,11 @@ describe("여러 자산 보유: 입력", () => {
     expect([b.asset, b.amount]).toEqual(["TRX", "300"]);
   });
 
-  it("보유하지 않은 자산의 지출과 자산별 재원 부족을 막는다", () => {
-    const bad = { ...multi, expenses: [...multi.expenses, { id: "e3", date: addDays(TODAY, 5), amount: "10", asset: "USDD" }] };
-    expect(inputProblems(bad).some((x) => /보유하지 않은 자산/.test(x))).toBe(true);
+  it("보유하지 않은 자산(USDD)의 지출은 대표 자산에서 환전하고, 자산별 재원 부족은 막는다", () => {
+    const withUsdd = { ...multi, expenses: [...multi.expenses, { id: "e3", date: addDays(TODAY, 5), amount: "10", asset: "USDD" }] };
+    expect(inputProblems(withUsdd)).toEqual([]);
+    expect(needsForHolding(withUsdd, { asset: "USDT", amount: "5000" }).expenses.map((e) => e.asset)).toEqual(["USDT", "USDD"]);
+    expect(needsForHolding(withUsdd, { asset: "TRX", amount: "20000" }).expenses.map((e) => e.asset)).toEqual(["TRX"]);
     const short = { ...multi, expenses: [{ id: "e1", date: addDays(TODAY, 20), amount: "25000", asset: "TRX" }] };
     expect(inputProblems(short).some((x) => /TRX/.test(x) && /보유액/.test(x))).toBe(true);
     expect(inputProblems(multi)).toEqual([]);
@@ -236,5 +239,108 @@ describe("TRX 보유자의 USDD 경로 (계획 B)", () => {
     const labels = B.steps.map((s) => s.label);
     expect(labels.filter((l) => /브리지/.test(l))).toHaveLength(4); // 진입 승인·전환, 출구 승인·전환
     expect(B.steps.filter((s) => s.action === "swap").map((s) => s.asset)).toEqual(["TRX", "USDD(구)"]);
+  });
+});
+
+describe("보유 자산과 다른 자산으로 내는 지출 (환전)", () => {
+  const swap: SwapMarket = {
+    router: "Tr", pair: "Tp", reserveUsdt: "47000000", reserveTrx: "140000000", feeNumerator: 997,
+    costs: { toTrx: { energy: 200000, bandwidth: 500 }, toUsdt: { energy: 210000, bandwidth: 520 }, sampleSize: 10 }, source: live(),
+  };
+  const psm: ProductQuote = { id: "psm", kind: "psm", market: "PSM", token: "USDD", address: "Tpsm", chain: "mainnet", active: true, rewards: { status: "none", note: "" }, psm: { feeIn: "0.001", feeOut: "0", sellEnabled: true, buyEnabled: true, entryCapacity: "1e9", exitLiquidity: "1e9" }, source: live() };
+  const trxNeeds: UserNeeds = { ...emptyNeeds("mainnet", TODAY), asset: "TRX", amount: "10000", endDate: addDays(TODAY, 60), expensesStated: true, bufferAmount: "0", riskProfile: "balanced", acceptUsddRisk: false, version: 1,
+    expenses: [{ id: "u", date: addDays(TODAY, 7), amount: "200", asset: "USDT" }, { id: "d", date: addDays(TODAY, 30), amount: "100", asset: "USDD" }] };
+
+  it("TRX 보유자의 USDT·USDD 지출을 오늘 환전할 TRX 필요량으로 확보한다 (역산이 실제 교환 결과를 채운다)", () => {
+    const r = buildMainnetPlans(trxNeeds, { ...inputs, psm, swap }, NOW);
+    expect(r.conversions?.map((c) => [c.need.asset, c.pay.asset])).toEqual([["USDT", "TRX"], ["USDD", "TRX"]]);
+    const u = r.conversions![0];
+    // 필요량(비용 제외)으로 교환하면 USDT 200 이상을 받는다
+    const payNoCost = new Decimal(u.pay.amount).minus(u.costTrx);
+    expect(trxToUsdt(swap, payNoCost).gte(200)).toBe(true);
+    expect(Number(r.reserved.total)).toBeCloseTo(r.conversions!.reduce((a, c) => a + Number(c.pay.amount), 0), 6);
+    expect(r.needs.expenses.map((e) => e.asset)).toEqual(["USDT", "USDD"]); // 결과에는 사용자가 말한 그대로 남긴다
+  });
+  it("USDT 보유자의 TRX 지출도 필요량을 역산하고, 견적이 없으면 보유액 전부를 확보하며 이유를 남긴다", () => {
+    const n: UserNeeds = { ...trxNeeds, asset: "USDT", amount: "5000", expenses: [{ id: "t", date: addDays(TODAY, 7), amount: "1000", asset: "TRX" }] };
+    const r = buildMainnetPlans(n, { ...inputs, swap }, NOW);
+    expect(usdtToTrx(swap, new Decimal(r.conversions![0].pay.amount)).gte(1000)).toBe(true);
+    const none = buildMainnetPlans(n, { ...inputs, swap: undefined }, NOW);
+    expect(none.investable).toBe("0");
+    expect(none.warnings.some((w) => /환전 견적이 없어/.test(w))).toBe(true);
+  });
+});
+
+describe("비용 가정 (비용 기준 · Energy 조달 방식)", () => {
+  const b: CostBasis = {
+    ...basis,
+    jTokenCosts: { jUSDT: { supply: { energy: 190000, bandwidth: 400 }, withdraw: { energy: 210000, bandwidth: 400 }, sampleSize: 30, median: { supply: { energy: 120000, bandwidth: 350 }, withdraw: { energy: 110000, bandwidth: 350 } } } },
+  };
+  const n: UserNeeds = { ...emptyNeeds("mainnet", TODAY), amount: "10000", endDate: addDays(TODAY, 30), expensesStated: true, bufferAmount: "0", riskProfile: "balanced", acceptUsddRisk: false, version: 1 };
+  const A = (inp: object) => buildMainnetPlans(n, { ...inputs, ...inp }, NOW).plans.find((p) => p.key === "A")!;
+
+  it("중앙값·일반값 기준은 실측 최대값보다 Energy가 적다", () => {
+    const max = A({ costBasis: b });
+    const med = A(applyCostOptions({ ...inputs, costBasis: b }, "median"));
+    const typ = A(applyCostOptions({ ...inputs, costBasis: b }, "typical"));
+    expect(max.costs.energy).toBe(23000 + 190000 + 210000);
+    expect(med.costs.energy).toBe(23000 + 120000 + 110000);
+    expect(typ.costs.energy).toBe(23000 + 100000 + 90000); // JustLend MCP 일반값
+    expect(med.steps.find((s) => s.action === "supply")!.energySource).toMatch(/중앙값/);
+  });
+  it("스테이킹 방식은 Energy 소각이 없고, 필요한 스테이킹 TRX를 알려 준다", () => {
+    const st = { mode: "stake" as const, burnFeeSun: 100, energyStakePerTrx: "10" };
+    const r = buildMainnetPlans(n, applyCostOptions({ ...inputs, costBasis: b }, "max", st), NOW);
+    const a = r.plans.find((p) => p.key === "A")!;
+    expect(Number(a.costs.trx)).toBeCloseTo((400 + 400 + 265) * 1000 / 1e6, 9); // 대역폭만
+    if (a.recommended) expect(r.warnings.some((w) => /스테이킹해 두어야/.test(w))).toBe(true);
+  });
+  it("대여 방식은 날짜별로 한 번 빌린다: 대여료 + 사용분 차감 + 최소 수수료", () => {
+    const rent = { ratePerTrxSec: "0.00000000625", feeRatio: "0.00008", minFeeTrx: "20", usageChargeRatio: "0.75", durationSec: 3600 };
+    const one = rentalCostTrx(233000, rent, "10");
+    const trx = Math.ceil(233000 / 10);
+    expect(one.toNumber()).toBeCloseTo(trx * 6.25e-9 * 3600 + trx * 6.25e-9 * 86400 * 0.75 + 20, 9);
+    const a = A(applyCostOptions({ ...inputs, costBasis: b }, "max", { mode: "rent", burnFeeSun: 100, energyStakePerTrx: "10", rent }));
+    // D+0(승인+예치)과 D+30(인출) 두 번 빌림
+    const expected = rentalCostTrx(23000 + 190000, rent, "10").plus(rentalCostTrx(210000, rent, "10")).plus((400 + 400 + 265) * 1000 / 1e6);
+    expect(Number(a.costs.trx)).toBeCloseTo(expected.toNumber(), 9);
+  });
+});
+
+describe("USDD 보유자", () => {
+  const psmQ: ProductQuote = { id: "psm", kind: "psm", market: "PSM", token: "USDD", address: "Tpsm", chain: "mainnet", active: true, rewards: { status: "none", note: "" }, psm: { feeIn: "0.001", feeOut: "0.002", sellEnabled: true, buyEnabled: true, entryCapacity: "1e9", exitLiquidity: "1e9" }, source: live() };
+  const swap: SwapMarket = { router: "Tr", pair: "Tp", reserveUsdt: "47000000", reserveTrx: "140000000", feeNumerator: 997, costs: { toTrx: { energy: 200000, bandwidth: 500 }, toUsdt: { energy: 210000, bandwidth: 520 }, sampleSize: 10 }, source: live() };
+  const bUsdd: CostBasis = { ...basis, trxPerUsdd: "2.97", psmEnergy: { sell: 250000, buy: 310000, sampleSize: 10 } };
+  const inp = { ...inputs, jusdd: lending("jUSDD", "USDD", "0.02"), psm: psmQ, swap, costBasis: bUsdd };
+  const n: UserNeeds = { ...emptyNeeds("mainnet", TODAY), asset: "USDD", amount: "20000", endDate: addDays(TODAY, 120), expensesStated: true, expenses: [], bufferAmount: "0", riskProfile: "aggressive", version: 1 };
+
+  it("USDD만 보유하면 USDD 위험 동의를 묻지 않고, 대화에서 USDD 금액을 뽑는다", () => {
+    expect(missingFields(n)).toEqual([]);
+    const p = templateExtract("USDD 2,000을 60일 운용해요", undefined, TODAY);
+    expect([p.asset, p.amount]).toEqual(["USDD", "2000"]);
+  });
+  it("A는 jUSDD 예치(승인 포함), B는 PSM으로 USDT를 받아 jUSDT, C는 PSM → SunSwap → 스테이킹으로 계산한다", () => {
+    const r = buildMainnetPlans(n, inp, NOW);
+    const A = r.plans.find((p) => p.key === "A")!;
+    expect(A.steps.filter((x) => x.action !== "hold").map((x) => x.action)).toEqual(["approve", "supply", "withdraw"]);
+    expect(A.steps.find((x) => x.action === "supply")!.contract).toBe("TjUSDD");
+    expect(A.riskClass).toBe("stable");
+    const B = r.plans.find((p) => p.key === "B")!;
+    expect(B.eligibility).not.toBe("ineligible");
+    expect(B.steps.filter((x) => x.action !== "hold").map((x) => x.action)).toEqual(["approve", "psm_buy", "approve", "supply", "withdraw", "approve", "psm_sell"]);
+    expect(B.steps.find((x) => x.action === "supply")!.contract).toBe("TjUSDT");
+    expect(B.riskClass).toBe("stable_conversion");
+    const C = r.plans.find((p) => p.key === "C")!;
+    expect(C.steps.filter((x) => x.action === "psm_buy" || x.action === "psm_sell").map((x) => [x.action, x.day])).toEqual([["psm_buy", 0], ["psm_sell", 120]]);
+    expect(C.riskClass).toBe("volatile");
+    // 거래비용은 USDD로 환산 (1 USDD = 2.97 TRX)
+    expect(Number(A.costs.inAsset)).toBeCloseTo(Number(A.costs.trx) / 2.97, 9);
+  });
+  it("USDD 보유자의 USDT·TRX 지출은 PSM 출구 수수료(와 교환)를 포함해 USDD 필요량으로 확보한다", () => {
+    const m: UserNeeds = { ...n, expenses: [{ id: "u", date: addDays(TODAY, 10), amount: "1000", asset: "USDT" }, { id: "t", date: addDays(TODAY, 20), amount: "3000", asset: "TRX" }] };
+    const r = buildMainnetPlans(m, inp, NOW);
+    const [u, t] = r.conversions!;
+    expect(new Decimal(u.pay.amount).minus(new Decimal(u.costTrx).div("2.97")).toNumber()).toBeCloseTo(1000 * 1.002, 5);
+    expect(t.route).toMatch(/PSM USDD → USDT → SunSwap/);
   });
 });

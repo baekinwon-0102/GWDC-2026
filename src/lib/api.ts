@@ -1,3 +1,4 @@
+import type { PersistedState } from "./storage";
 import type { CallAction, CallSpec, ChatMessage, ChatResponse, MissingField, Observation, PlanningResult, TxKind, TxStatusResponse, UserNeeds } from "../../shared/schemas";
 import type { AgentContext, AgentResponse, ReevaluateResponse } from "../../shared/agent";
 import type { NileAdjustment } from "../../shared/adjust";
@@ -61,6 +62,7 @@ export const api = {
     req<ChatResponse>("/api/chat", { method: "POST", body: JSON.stringify({ messages, needs, lastAsked }) }),
   plans: (needs: UserNeeds, walletAddress?: string) => req<PlanningResult>("/api/plans", { method: "POST", body: JSON.stringify({ needs, walletAddress }) }),
   market: () => req<any>("/api/market"),
+  explain: (id: string) => req<{ explanation: PlanningResult["explanation"]; parts?: PlanningResult["explanation"][] }>("/api/explain", { method: "POST", body: JSON.stringify({ id }) }),
   observe: (wallet: string, planId?: string) =>
     req<ObserveResponse>("/api/observe", { method: "POST", body: JSON.stringify({ chain: "nile", wallet, planId, positionId: "jTRX" }) }),
   tx: (txId: string) => req<TxStatusResponse>(`/api/transactions/${txId}?chain=nile`),
@@ -91,3 +93,22 @@ export const api = {
       }),
     }),
 };
+
+/**
+ * 계획을 받은 뒤 AI 설명을 따로 받아 저장된 분석에 끼워 넣는다 (계획은 먼저 보이고, 설명은 도착하면 바뀜).
+ * 실패하면 템플릿 설명을 그대로 두고 사유만 남긴다.
+ */
+export function fillExplanation(r: PlanningResult, update: (fn: (s: PersistedState) => PersistedState) => void) {
+  if (!r.explanation.pending) return;
+  const apply = (fn: (a: PlanningResult) => PlanningResult) => update((s) => ({ ...s, analyses: s.analyses.map((a) => (a.id === r.id ? fn(a) : a)) }));
+  api
+    .explain(r.id)
+    .then((x) =>
+      apply((a) => ({
+        ...a,
+        explanation: x.explanation,
+        portfolio: a.portfolio && x.parts ? { ...a.portfolio, parts: a.portfolio.parts.map((pt, i) => ({ ...pt, result: { ...pt.result, explanation: x.parts![i] ?? pt.result.explanation } })) } : a.portfolio,
+      })),
+    )
+    .catch((e) => apply((a) => ({ ...a, explanation: { ...a.explanation, pending: false, fallbackReason: `AI 설명 실패: ${(e as Error).message}` } })));
+}

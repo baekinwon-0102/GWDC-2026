@@ -42,7 +42,7 @@ export const EXTRACT_SYSTEM_PROMPT = (today: string, current: UserNeeds) => `너
 규칙:
 - 금액·날짜·금리를 추측하거나 계산하지 않는다. 사용자가 말하지 않은 필드는 null.
 - 금액은 쉼표 없는 숫자 문자열 ("1,000 USDT" → "1000").
-- 보유 자산 종류를 말하면 asset에 "USDT" 또는 "TRX"를 넣는다 ("10,000 TRX를 운용" → "TRX", "테더" → "USDT"). 말하지 않으면 null.
+- 보유 자산 종류를 말하면 asset에 "USDT", "TRX", "USDD" 중 하나를 넣는다 ("10,000 TRX를 운용" → "TRX", "테더" → "USDT", "USDD 2천" → "USDD"). 말하지 않으면 null.
 - 보유 자산을 두 가지 이상 말하면 holdings에 전체 목록을 넣고 asset·amount는 첫 번째 자산으로 둔다 ("USDT 5,000과 TRX 20,000" → holdings [{"asset":"USDT","amount":"5000"},{"asset":"TRX","amount":"20000"}]). 한 가지만 말하면 holdings는 null.
 - 운용 기간이 "30일", "한 달"처럼 상대값이면 durationDays(정수, 한 달=30). 날짜로 말하면 endDate(YYYY-MM-DD).
 - 지출은 "7일 뒤"면 inDays=7, 날짜면 date. 사용자가 지출을 새로 말하거나 바꾸면 **변경 후 전체 지출 목록**을 expenses에 넣는다 (기존 지출 중 유지되는 것도 포함).
@@ -52,7 +52,7 @@ export const EXTRACT_SYSTEM_PROMPT = (today: string, current: UserNeeds) => `너
 - USDD 위험 질문에 "예/감수/괜찮다"면 acceptUsddRisk=true, "아니오/싫다"면 false.
 - 다른 설명 없이 아래 형식의 JSON 객체 하나만 출력한다.
 
-{"asset":"USDT"|"TRX"|null,"amount":string|null,"holdings":[{"asset":"USDT"|"TRX","amount":string}]|null,"durationDays":number|null,"endDate":string|null,"expenses":[{"inDays":number|null,"date":string|null,"amount":string,"asset":string|null,"label":string|null}]|null,"noExpenses":boolean|null,"bufferAmount":string|null,"riskProfile":"conservative"|"balanced"|"aggressive"|null,"acceptUsddRisk":boolean|null}`;
+{"asset":"USDT"|"TRX"|"USDD"|null,"amount":string|null,"holdings":[{"asset":"USDT"|"TRX"|"USDD","amount":string}]|null,"durationDays":number|null,"endDate":string|null,"expenses":[{"inDays":number|null,"date":string|null,"amount":string,"asset":string|null,"label":string|null}]|null,"noExpenses":boolean|null,"bufferAmount":string|null,"riskProfile":"conservative"|"balanced"|"aggressive"|null,"acceptUsddRisk":boolean|null}`;
 
 export const EXPLAIN_SYSTEM_PROMPT = `너는 TRON 자산 계획 앱의 설명 담당이다. 코드가 계산해 검증한 결과(JSON)만 근거로 한국어로 설명한다.
 규칙:

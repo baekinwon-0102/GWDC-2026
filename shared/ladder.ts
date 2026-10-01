@@ -46,7 +46,8 @@ export function buildLadderPlan(
 ): Plan {
   const asset = needs.asset;
   const holdsTrx = asset === "TRX";
-  const evalAsset: "USDT" | "TRX" = holdsTrx ? "TRX" : "USDT";
+  const holdsUsdd = asset === "USDD";
+  const evalAsset = asset;
   const days = base.horizonDays;
   const amount = new Decimal(needs.amount ?? 0);
   const reserved = reservedWithinHorizon(needs);
@@ -75,13 +76,20 @@ export function buildLadderPlan(
   const noteUnusable = (label: string, p?: Plan) => {
     if (p && p.eligibility === "ineligible" && p.reasons[0]) unavailable.push(`${label}: ${p.reasons[0]}`);
   };
-  noteUnusable(holdsTrx ? "jTRX 예치" : "jUSDT 예치", singles.A);
-  if (!holdsTrx) noteUnusable("USDD 경로", singles.B);
+  noteUnusable(holdsTrx ? "jTRX 예치" : holdsUsdd ? "jUSDD 예치" : "jUSDT 예치", singles.A);
+  if (asset === "USDT") noteUnusable("USDD 경로", singles.B);
   noteUnusable("TRX 스테이킹", singles.C);
 
-  // 같은 자산 예치 (jUSDT 또는 jTRX)
-  const lendQ = holdsTrx ? inputs.jtrx : inputs.jusdt;
-  const lendMarket = holdsTrx ? "jTRX" : "jUSDT";
+  // 같은 자산 예치 (jUSDT · jTRX · jUSDD). USDD 보유자의 jUSDD는 검증된 캠페인 기간분 채굴 보상도 구간 수익에 넣는다
+  const lendQ = holdsTrx ? inputs.jtrx : holdsUsdd ? inputs.jusdd : inputs.jusdt;
+  const lendMarket = holdsTrx ? "jTRX" : holdsUsdd ? "jUSDD" : "jUSDT";
+  const mined = (q: typeof lendQ, b: Bucket) => {
+    const c = q?.rewards.status === "verified" ? q.rewards.campaign : undefined;
+    if (!c || !q?.rewards.apr) return ZERO;
+    const from = Math.max(now.getTime(), Date.parse(c.start));
+    const to = Math.min(Date.parse(`${addDays(needs.startDate, b.needDay)}T00:00:00+09:00`), Date.parse(c.end));
+    return b.amount.mul(q.rewards.apr).mul(Decimal.max(new Decimal(to - from).div(86_400_000), 0)).div(365);
+  };
   if (usable(singles.A) && lendQ?.baseRate) {
     const res = jTokenResources(basis, lendMarket);
     const rate = new Decimal(lendQ.baseRate);
@@ -89,7 +97,7 @@ export function buildLadderPlan(
       key: "LEND",
       label: `JustLend ${lendMarket} 예치`,
       allowed: (b) => (b.needDay <= 0 ? "바로 쓸 돈이라 예치할 수 없습니다." : undefined),
-      yieldOf: (b) => baseYield(b.amount, rate, lendQ.rateType ?? "APY", b.needDay),
+      yieldOf: (b) => baseYield(b.amount, rate, lendQ.rateType ?? "APY", b.needDay).plus(holdsUsdd ? mined(lendQ, b) : ZERO),
       stepsFor: (bs) => {
         const total = bs.reduce((s, b) => s.plus(b.amount), ZERO);
         const steps: PlanStep[] = [];
@@ -105,7 +113,7 @@ export function buildLadderPlan(
   // USDD 경로 (USDT 보유자, 동의·성향 허용 시)
   const { jusdd, psm } = inputs;
   const pe = basis?.psmEnergy;
-  if (!holdsTrx && usable(singles.B) && jusdd?.baseRate && psm?.psm && pe) {
+  if (asset === "USDT" && usable(singles.B) && jusdd?.baseRate && psm?.psm && pe) {
     const res = jTokenResources(basis, "jUSDD");
     const rate = new Decimal(jusdd.baseRate);
     const feeIn = new Decimal(psm.psm.feeIn);
@@ -148,9 +156,12 @@ export function buildLadderPlan(
     });
   }
 
-  // TRX 스테이킹. USDT 보유자는 SunSwap V2로 교환해 넣고 인출일마다 되돌린다 (교환 손실은 전환 비용)
+  // TRX 스테이킹. USDT 보유자는 SunSwap V2로 교환해 넣고 인출일마다 되돌린다 (교환 손실은 전환 비용).
+  // USDD 보유자는 앞뒤로 PSM(USDD → USDT: tout, USDT → USDD: tin)을 더 거친다.
   const st = inputs.staking;
   const sw = holdsTrx ? undefined : inputs.swap;
+  const pIn = holdsUsdd && psm?.psm ? new Decimal(psm.psm.feeIn) : ZERO;
+  const pOut = holdsUsdd && psm?.psm ? new Decimal(psm.psm.feeOut) : ZERO;
   if (usable(singles.C) && st?.baseRate && st.staking && (holdsTrx || sw)) {
     const s = st.staking;
     const delay = new Decimal(s.unfreezeDelayDays);
@@ -166,9 +177,11 @@ export function buildLadderPlan(
     /** USDT 보유자: 배정된 구간 합계를 한 번에 TRX로 바꾸고, 인출일마다 그 몫을 되돌린다 */
     const swapPlan = (bs: Bucket[]) => {
       const total = bs.reduce((s2, b) => s2.plus(b.amount), ZERO);
-      const trx = swapOut(total, rU, rT, sw!.feeNumerator);
+      const usdt = holdsUsdd ? total.div(new Decimal(1).plus(pOut)).toDecimalPlaces(6, Decimal.ROUND_DOWN) : total;
+      const trx = swapOut(usdt, rU, rT, sw!.feeNumerator);
       const back = groupByDay(bs).map(([d, amt]) => ({ d, trx: trx.mul(amt).div(total).toDecimalPlaces(6, Decimal.ROUND_DOWN) }));
-      return { total, trx, back, loss: total.minus(back.reduce((s2, x) => s2.plus(swapOut(x.trx, rT, rU, sw!.feeNumerator)), ZERO)) };
+      const backAsset = back.reduce((s2, x) => s2.plus(swapOut(x.trx, rT, rU, sw!.feeNumerator)), ZERO).mul(new Decimal(1).minus(pIn));
+      return { total, usdt, trx, back, loss: total.minus(backAsset) };
     };
     models.push({
       key: "STAKE",
@@ -181,9 +194,13 @@ export function buildLadderPlan(
         const sp = sw ? swapPlan(bs) : undefined;
         const trxTotal = sp ? sp.trx : total;
         const steps: PlanStep[] = [];
+        if (sp && holdsUsdd && psm?.psm) {
+          steps.push(at(step("approve", "USDD 사용 승인 (PSM)", "USDD", total, TYPICAL_RESOURCES.approve, JUSTLEND_RES_SRC, psm.address), 0));
+          steps.push(at(step("psm_buy", "PSM 전환 USDD → USDT", "USDD", total, { energy: pe?.buy ?? 0, bandwidth: pe?.bandwidth?.buy ?? TYPICAL_RESOURCES.psm.bandwidth }, "PSM 실측", psm.address), 0));
+        }
         if (sp) {
-          steps.push(at(step("approve", "USDT 사용 승인 (SunSwap V2 라우터)", "USDT", total, TYPICAL_RESOURCES.approve, JUSTLEND_RES_SRC, sw!.router), 0));
-          steps.push(at(step("swap", "SunSwap V2 교환 USDT → TRX", "USDT", total, sw!.costs.toTrx, swapSrc, sw!.router), 0));
+          steps.push(at(step("approve", "USDT 사용 승인 (SunSwap V2 라우터)", "USDT", sp.usdt, TYPICAL_RESOURCES.approve, JUSTLEND_RES_SRC, sw!.router), 0));
+          steps.push(at(step("swap", "SunSwap V2 교환 USDT → TRX", "USDT", sp.usdt, sw!.costs.toTrx, swapSrc, sw!.router), 0));
         }
         steps.push(at(step("stake", "TRX 스테이킹 (FreezeBalanceV2)", "TRX", trxTotal, sys(bw?.stake), src), 0), at(step("vote", `SR 투표 (${s.srName})`, "TRX", trxTotal, sys(bw?.vote), src, s.srAddress), 0));
         for (const [d, amt] of groupByDay(bs)) {
@@ -192,6 +209,10 @@ export function buildLadderPlan(
           steps.push(at(step("unstake", `스테이킹 해제 (${delay.toFixed()}일 뒤 인출 가능)`, "TRX", trxAmt, sys(bw?.unstake), src), off));
           steps.push(at(step("withdraw", "해제 완료분 인출 (WithdrawExpireUnfreeze)", "TRX", trxAmt, sys(bw?.withdrawExpire), src), d));
           if (sp) steps.push(at(step("swap", "SunSwap V2 교환 TRX → USDT", "TRX", trxAmt, sw!.costs.toUsdt, swapSrc, sw!.router), d));
+          if (sp && holdsUsdd && psm?.psm) {
+            steps.push(at(step("approve", "USDT 사용 승인 (PSM 출구)", "USDT", amt, TYPICAL_RESOURCES.approve, JUSTLEND_RES_SRC, psm.address), d));
+            steps.push(at(step("psm_sell", "PSM 전환 USDT → USDD", "USDT", amt, { energy: pe?.sell ?? 0, bandwidth: pe?.bandwidth?.sell ?? TYPICAL_RESOURCES.psm.bandwidth }, "PSM 실측", psm.address), d));
+          }
         }
         steps.push(at(step("claim", "투표 보상 청구 (WithdrawBalance)", "TRX", ZERO, sys(bw?.claim), src), Math.max(...bs.map((b) => b.needDay))));
         return steps;

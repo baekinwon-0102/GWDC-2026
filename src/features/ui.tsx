@@ -1,8 +1,41 @@
 import type { ReactNode } from "react";
-import type { Plan } from "../../shared/schemas";
+import type { CostBasis, Plan } from "../../shared/schemas";
 import { Money, Tip } from "./common";
 
 // 계획 비교·Nile 실행 탭이 같이 쓰는 화면 부품: 배분 막대, 계획 카드, 인출일 타임라인, 진행 점, 팝업.
+
+/** 1 단위 자산이 몇 TRX인지 (JustLend 오라클 가격). 모르면 undefined */
+export function trxPer(asset: string, b?: Pick<CostBasis, "trxPerUsdt" | "trxPerUsdd">): number | undefined {
+  if (asset === "TRX") return 1;
+  const v = asset === "USDD" ? (b?.trxPerUsdd ?? b?.trxPerUsdt) : b?.trxPerUsdt;
+  return v && Number(v) > 0 ? Number(v) : undefined;
+}
+
+/**
+ * 수익은 모든 보유 자산을 같은 단위로 비교하도록 TRX로 크게 보이고, 원래 자산 금액은 작게 함께 적는다.
+ * (오늘 가격으로 단위만 바꾸는 것이라 같은 보유자 안의 계획 순위는 바뀌지 않는다)
+ */
+export function TrxAmount({ v, asset, basis, dp = 2, signed, native = true }: { v?: string; asset: string; basis?: Pick<CostBasis, "trxPerUsdt" | "trxPerUsdd">; dp?: number; signed?: boolean; native?: boolean }) {
+  if (v === undefined) return <span className="muted">산정 불가</span>;
+  const r = trxPer(asset, basis);
+  if (asset === "TRX" || r === undefined)
+    return (
+      <>
+        <Money v={v} dp={dp} signed={signed} /> <small>{asset}</small>
+      </>
+    );
+  return (
+    <>
+      <Money v={String(Number(v) * r)} dp={dp} signed={signed} /> <small>TRX</small>
+      {native && (
+        <span className="tiny muted" style={{ fontWeight: 400 }}>
+          {" "}
+          (<Money v={v} dp={dp} signed={signed} /> {asset})
+        </span>
+      )}
+    </>
+  );
+}
 
 /** 넣을 곳 이름으로 색을 고른다 (보유 = 회색, 예치 = 청록, USDD = 호박, 스테이킹 = 산호) */
 export function productTone(label: string): "gray" | "teal" | "amber" | "coral" {
@@ -60,9 +93,11 @@ export function PlanCard({
   onSelect,
   lines = [],
   disabled,
+  basis,
 }: {
   plan: Plan;
   asset: string;
+  basis?: Pick<CostBasis, "trxPerUsdt" | "trxPerUsdd">;
   selected?: boolean;
   onSelect?: () => void;
   lines?: string[];
@@ -80,7 +115,7 @@ export function PlanCard({
       </div>
       <div className="pcard-title">{plan.title}</div>
       <div className="pcard-net">
-        <Money v={plan.netReturn} dp={plan.netReturn !== undefined && Math.abs(Number(plan.netReturn)) >= 100 ? 2 : 4} signed /> <small>{asset}</small>
+        <TrxAmount v={plan.netReturn} asset={asset} basis={basis} signed />
       </div>
       <div className="pcard-lines">
         {[be, plan.riskClass ? RISK_KO[plan.riskClass] : undefined, plan.key !== "HOLD" ? `예치 ${Number(plan.allocation.invested).toLocaleString()} · 보유 ${Number(plan.allocation.held).toLocaleString()}` : "거래 없음", ...lines]
@@ -99,7 +134,7 @@ export function PlanCard({
 }
 
 /** 인출일별 분산 타임라인: 구간마다 D+0부터 돈이 필요한 날까지의 막대 */
-export function LadderTimeline({ plan, asset }: { plan: Plan; asset: string }) {
+export function LadderTimeline({ plan, asset, basis }: { plan: Plan; asset: string; basis?: Pick<CostBasis, "trxPerUsdt" | "trxPerUsdd"> }) {
   const ladder = plan.ladder ?? [];
   const horizon = Math.max(plan.horizonDays, ...ladder.map((b) => b.needDay), 1);
   return (
@@ -122,7 +157,7 @@ export function LadderTimeline({ plan, asset }: { plan: Plan; asset: string }) {
             </div>
           </div>
           <div className="tl-yield">
-            <Money v={b.yield} dp={2} signed />
+            <TrxAmount v={b.yield} asset={asset} basis={basis} signed native={false} />
           </div>
         </div>
       ))}

@@ -12,13 +12,13 @@ export function templateExtract(text: string, lastAsked?: MissingField, today?: 
 
   // 지출: "7일 뒤 200 USDT", "10월 5일에 150 USDT"
   const expenses: NonNullable<NeedsPatch["expenses"]> = [];
-  rest = rest.replace(new RegExp(`(\\d+)\\s*일\\s*(?:뒤|후)(?:에)?[^\\d]{0,6}${NUM}\\s*(USDT|TRX)?`, "gi"), (_, days, amt, asset) => {
+  rest = rest.replace(new RegExp(`(\\d+)\\s*일\\s*(?:뒤|후)(?:에)?[^\\d]{0,6}${NUM}\\s*(USDT|TRX|USDD)?`, "gi"), (_, days, amt, asset) => {
     expenses.push({ inDays: Number(days), amount: clean(amt), asset: asset?.toUpperCase() ?? null });
     return " ";
   });
   if (today) {
     const year = Number(today.slice(0, 4));
-    rest = rest.replace(new RegExp(`(\\d{1,2})\\s*월\\s*(\\d{1,2})\\s*일(?:에)?[^\\d]{0,6}${NUM}\\s*(USDT|TRX)?`, "gi"), (_, m, dd, amt, asset) => {
+    rest = rest.replace(new RegExp(`(\\d{1,2})\\s*월\\s*(\\d{1,2})\\s*일(?:에)?[^\\d]{0,6}${NUM}\\s*(USDT|TRX|USDD)?`, "gi"), (_, m, dd, amt, asset) => {
       let date = `${year}-${String(m).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
       if (date < today) date = `${year + 1}${date.slice(4)}`;
       expenses.push({ date, amount: clean(amt), asset: asset?.toUpperCase() ?? null });
@@ -53,9 +53,10 @@ export function templateExtract(text: string, lastAsked?: MissingField, today?: 
   }
 
   // 보유 금액: "1,000 USDT", "USDT 5,000", 여러 자산이면 전체 목록
-  const found: { asset: "USDT" | "TRX"; amount: string }[] = [];
-  rest.replace(new RegExp(`${NUM}\\s*(USDT|TRX|테더)|(USDT|TRX|테더)\\s*${NUM}`, "gi"), (_, a1, s1, s2, a2) => {
-    const asset = /TRX/i.test(s1 ?? s2) ? "TRX" : "USDT";
+  const found: { asset: "USDT" | "TRX" | "USDD"; amount: string }[] = [];
+  rest.replace(new RegExp(`${NUM}\\s*(USDT|TRX|USDD|테더)|(USDT|TRX|USDD|테더)\\s*${NUM}`, "gi"), (_, a1, s1, s2, a2) => {
+    const sym = s1 ?? s2;
+    const asset = /TRX/i.test(sym) ? "TRX" : /USDD/i.test(sym) ? "USDD" : "USDT";
     found.push({ asset, amount: clean(a1 ?? a2) });
     return " ";
   });

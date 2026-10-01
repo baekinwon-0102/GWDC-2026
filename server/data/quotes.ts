@@ -74,11 +74,29 @@ async function mainnetFees(): Promise<{ fees: { energyFeeSun: number; bandwidthF
 }
 
 let cache: { at: number; value: Fetched<MainnetInputs> } | undefined;
-const CACHE_MS = 60_000;
+let inflight: Promise<Fetched<MainnetInputs>> | undefined;
+/** 1분 안의 값은 그대로, 5분 안의 값은 바로 주고 뒤에서 갱신한다 (실행 판정의 신선도 기준 10분보다 짧다) */
+const FRESH_MS = 60_000;
+const SERVE_MS = 5 * 60_000;
 
 export async function getMainnetInputs(force = false): Promise<Fetched<MainnetInputs>> {
   if (env.dataMode === "synthetic") return { inputs: syntheticMainnet(), failures: [], mode: "synthetic" };
-  if (!force && cache && Date.now() - cache.at < CACHE_MS) return cache.value;
+  const age = cache ? Date.now() - cache.at : Infinity;
+  if (!force && cache && age < FRESH_MS) return cache.value;
+  if (!force && cache && age < SERVE_MS) {
+    void refreshMainnetInputs().catch(() => undefined);
+    return cache.value;
+  }
+  return refreshMainnetInputs();
+}
+
+/** 시세를 새로 읽는다. 동시에 여러 요청이 와도 조회는 한 번만 한다 (서버 백그라운드 갱신도 이 함수를 쓴다) */
+export function refreshMainnetInputs(): Promise<Fetched<MainnetInputs>> {
+  if (!inflight) inflight = loadMainnetInputs().finally(() => (inflight = undefined));
+  return inflight;
+}
+
+async function loadMainnetInputs(): Promise<Fetched<MainnetInputs>> {
 
   const failures: string[] = [];
   const [markets, psm, feeResult, psmEnergy, staking, jTokenCosts, universe, swap, usddSavings] = await Promise.all([
@@ -103,6 +121,11 @@ export async function getMainnetInputs(force = false): Promise<Fetched<MainnetIn
     costBasis = {
       ...fees,
       trxPerUsdt: markets?.trxPerUsdt,
+      // 1 USDD = (USDD 달러 가격 ÷ USDT 달러 가격) USDT → TRX 환산 (JustLend 오라클)
+      trxPerUsdd:
+        markets?.trxPerUsdt && markets.jusdd?.underlyingPriceUsd && markets.jusdt?.underlyingPriceUsd && Number(markets.jusdt.underlyingPriceUsd) > 0
+          ? String((Number(markets.trxPerUsdt) * Number(markets.jusdd.underlyingPriceUsd)) / Number(markets.jusdt.underlyingPriceUsd))
+          : undefined,
       psmEnergy,
       jTokenCosts: jTokenCosts && Object.keys(jTokenCosts).length ? jTokenCosts : undefined,
       source: { sourceUrl: "https://api.trongrid.io/wallet/getchainparameters", chain: "mainnet", fetchedAt: now, mode: "live", note: "getEnergyFee / getTransactionFee", ...meta },
@@ -125,7 +148,31 @@ export async function cachedJtrxEnergy() {
   return value;
 }
 
-export async function getNileInputs(): Promise<Fetched<Omit<NileInputs, "walletBalanceTrx">>> {
+let nileCache: { at: number; value: Fetched<Omit<NileInputs, "walletBalanceTrx">> } | undefined;
+let nileInflight: Promise<Fetched<Omit<NileInputs, "walletBalanceTrx">>> | undefined;
+
+export async function getNileInputs(force = false): Promise<Fetched<Omit<NileInputs, "walletBalanceTrx">>> {
+  const age = nileCache ? Date.now() - nileCache.at : Infinity;
+  if (!force && nileCache && age < FRESH_MS) return nileCache.value;
+  if (!force && nileCache && age < SERVE_MS) {
+    void refreshNileInputs().catch(() => undefined);
+    return nileCache.value;
+  }
+  return refreshNileInputs();
+}
+
+export function refreshNileInputs(): Promise<Fetched<Omit<NileInputs, "walletBalanceTrx">>> {
+  if (!nileInflight)
+    nileInflight = loadNileInputs()
+      .then((v) => {
+        if (!v.failures.length && v.mode === "live") nileCache = { at: Date.now(), value: v };
+        return v;
+      })
+      .finally(() => (nileInflight = undefined));
+  return nileInflight;
+}
+
+async function loadNileInputs(): Promise<Fetched<Omit<NileInputs, "walletBalanceTrx">>> {
   // 실거래가 켜져 있으면 Nile은 항상 실제 계약 값을 읽는다 (가상 값으로 거래 판단 금지).
   if (env.dataMode === "synthetic" && !env.enableNileExecution) {
     const now = new Date().toISOString();

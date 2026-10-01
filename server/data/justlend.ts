@@ -346,6 +346,7 @@ export async function nileJtrxEnergy(): Promise<NonNullable<CostBasis["jtrxEnerg
     redeemUnderlying: ru.energy,
     sampleSize: m.mint.sampleSize + m.redeem.sampleSize + (m.redeemUnderlying?.sampleSize ?? 0),
     bandwidth: { mint: m.mint.bandwidth, redeem: m.redeem.bandwidth, redeemUnderlying: ru.bandwidth },
+    median: { mint: m.mint.median.energy, redeem: m.redeem.median.energy, redeemUnderlying: ru.median.energy },
   };
 }
 
@@ -363,6 +364,10 @@ export async function mainnetJTokenCosts(): Promise<NonNullable<CostBasis["jToke
         supply: { energy: m.mint.energy, bandwidth: m.mint.bandwidth },
         withdraw: { energy: Math.max(...w.map((x) => x.energy)), bandwidth: Math.max(...w.map((x) => x.bandwidth)) },
         sampleSize: m.mint.sampleSize + w.reduce((s, x) => s + x.sampleSize, 0),
+        median: {
+          supply: m.mint.median,
+          withdraw: { energy: Math.max(...w.map((x) => x.median.energy)), bandwidth: Math.max(...w.map((x) => x.median.bandwidth)) },
+        },
       };
     }),
   );

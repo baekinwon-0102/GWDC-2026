@@ -4,6 +4,8 @@ import { dataIssues, lendingIssues, lendingWarnings, psmIssues } from "./eligibi
 import { prefersLowExposure, RISK_KO, riskBlock } from "./risk";
 import { buildScreening, type MarketInfo } from "./screening";
 import { buildLadderPlan } from "./ladder";
+import { costAssumption, energyCostTrx, stakeNeedNote, statKo } from "./costmode";
+import { convertExpenses } from "./fx";
 import type { CostBasis, DataMode, Plan, PlanCosts, PlanStep, PlanningResult, ProductQuote, RiskProfile, SourceMeta, UserNeeds } from "./schemas";
 
 export const ENGINE_VERSION = "planning-1.0.0";
@@ -44,14 +46,19 @@ export function breakEvenDays(principal: Decimal, rate: Decimal, rateType: "APY"
   return cost.mul(365).div(principal.mul(rate));
 }
 
-export function stepCosts(steps: PlanStep[], basis: CostBasis | undefined, evalAsset: "USDT" | "TRX", conversionFees = ZERO): PlanCosts {
+/** 순수익을 평가하는 자산 (보유 자산) */
+export type EvalAsset = "USDT" | "TRX" | "USDD";
+
+export function stepCosts(steps: PlanStep[], basis: CostBasis | undefined, evalAsset: EvalAsset, conversionFees = ZERO): PlanCosts {
   const energy = steps.reduce((s, x) => s + x.energy, 0);
   const bandwidth = steps.reduce((s, x) => s + x.bandwidth, 0);
   if (!basis) return { energy, bandwidth, trx: "0", inAsset: undefined, conversionFees: conversionFees.toFixed() };
-  const trx = new Decimal(energy * basis.energyFeeSun + bandwidth * basis.bandwidthFeeSun).div(1_000_000);
+  // Energy는 조달 방식(소각·스테이킹·대여)에 따라, 대역폭은 소각으로 환산한다
+  const trx = energyCostTrx(steps, basis).plus(new Decimal(bandwidth * basis.bandwidthFeeSun).div(1_000_000));
   let inAsset: Decimal | undefined;
+  const per = evalAsset === "USDD" ? (basis.trxPerUsdd ?? basis.trxPerUsdt) : basis.trxPerUsdt;
   if (evalAsset === "TRX") inAsset = trx;
-  else if (basis.trxPerUsdt && new Decimal(basis.trxPerUsdt).gt(0)) inAsset = trx.div(basis.trxPerUsdt);
+  else if (per && new Decimal(per).gt(0)) inAsset = trx.div(per);
   return { energy, bandwidth, trx: trx.toFixed(), inAsset: inAsset?.toFixed(), conversionFees: conversionFees.toFixed() };
 }
 
@@ -112,7 +119,7 @@ export interface SwapMarket {
   bridge?: { psm: string; gemJoin: string; token: string; symbol: string; feeIn: string; feeOut: string; energy?: { sell: number; buy: number } };
   /** 수수료 반영 분자 (V2: 997/1000 = 0.3%) */
   feeNumerator: number;
-  costs: { toTrx: { energy: number; bandwidth: number }; toUsdt: { energy: number; bandwidth: number }; sampleSize: number };
+  costs: { toTrx: { energy: number; bandwidth: number }; toUsdt: { energy: number; bandwidth: number }; sampleSize: number; median?: { toTrx: number; toUsdt: number } };
   source: SourceMeta;
 }
 
@@ -155,7 +162,7 @@ export function swapRoundTrip(sw: SwapMarket, usdtIn: Decimal, trxExtra = ZERO) 
 export function jTokenResources(basis: CostBasis | undefined, market: string) {
   const m = basis?.jTokenCosts?.[market];
   return m
-    ? { supply: m.supply, withdraw: m.withdraw, src: `${market} 최근 성공 거래 ${m.sampleSize}건 실측 최대값` }
+    ? { supply: m.supply, withdraw: m.withdraw, src: `${market} 최근 성공 거래 ${m.sampleSize}건 ${statKo(basis)}` }
     : { supply: market === "jTRX" ? TYPICAL_RESOURCES.supply_trx : TYPICAL_RESOURCES.supply_trc20, withdraw: TYPICAL_RESOURCES.withdraw, src: JUSTLEND_RES_SRC };
 }
 
@@ -164,7 +171,7 @@ export function jTokenResources(basis: CostBasis | undefined, market: string) {
  * 캠페인이 끝난 뒤 기간이나 규칙을 확인하지 못한 보상은 미확인 참고값(remainder)으로 둔다.
  * 보상 APR은 달러 기준이므로 원금의 달러 가치(기초자산 가격 ÷ 평가 자산 가격)로 환산한다. 가격이 없으면 1:1.
  */
-function rewardsFor(q: ProductQuote | undefined, principal: Decimal, days: number, basis: CostBasis | undefined, assetPriceUsd: string | undefined, now: Date, endDate: string | undefined, evalAsset: "USDT" | "TRX" = "USDT") {
+function rewardsFor(q: ProductQuote | undefined, principal: Decimal, days: number, basis: CostBasis | undefined, assetPriceUsd: string | undefined, now: Date, endDate: string | undefined, evalAsset: EvalAsset = "USDT") {
   const base = q?.rewards ?? { status: "unverified" as const, note: "보상 데이터를 확인하지 못했습니다." };
   if (!base.apr || principal.lte(0) || days <= 0) return { rewards: { status: base.status, note: base.note }, netAdd: ZERO, remainder: ZERO };
   const px = q?.underlyingPriceUsd && assetPriceUsd && new Decimal(assetPriceUsd).gt(0) ? new Decimal(q.underlyingPriceUsd).div(assetPriceUsd) : new Decimal(1);
@@ -203,13 +210,18 @@ function rewardsFor(q: ProductQuote | undefined, principal: Decimal, days: numbe
  * 계획 엔진. Mainnet 분석이 기본이고, chain을 "nile"로 주면 같은 로직(지출 재원·위험 성향·스테이킹·인출일별 분산·추천)을
  * Nile 실시간 값으로 계산한다 (Nile 결과는 테스트 TRX 기준이며 Mainnet 수익과 섞지 않는다).
  */
-export function buildMainnetPlans(needs: UserNeeds, inputs: MainnetInputs, now = new Date(), idPrefix = "m", chain: "mainnet" | "nile" = "mainnet"): Omit<PlanningResult, "explanation"> {
+export function buildMainnetPlans(needsIn: UserNeeds, inputs: MainnetInputs, now = new Date(), idPrefix = "m", chain: "mainnet" | "nile" = "mainnet"): Omit<PlanningResult, "explanation"> {
   const { jusdt, jusdd, psm, staking, jtrx, costBasis } = inputs;
+  // 보유 자산과 다른 자산의 지출은 오늘 환전해 보유할 필요량(보유 자산 기준)으로 바꿔 확보한다
+  const fx = convertExpenses(needsIn, inputs);
+  const needs = fx.needs;
   // 보유 자산이 TRX면 같은 자산 예치는 jTRX, USDT면 jUSDT. 자산을 바꾸는 경로(USDT→TRX 스테이킹, TRX→USDT→USDD)는 SunSwap V2 교환 견적으로 계산한다.
   const holdsTrx = needs.asset === "TRX";
-  const evalAsset: "USDT" | "TRX" = holdsTrx ? "TRX" : "USDT";
-  const lendQ = holdsTrx ? jtrx : jusdt;
-  const lendMarket = holdsTrx ? "jTRX" : "jUSDT";
+  // USDD 보유자: 같은 자산 예치는 jUSDD(채굴 보상 포함), B는 반대 방향(USDD → PSM → USDT → jUSDT), C는 PSM → SunSwap → 스테이킹
+  const holdsUsdd = needs.asset === "USDD";
+  const evalAsset: EvalAsset = needs.asset;
+  const lendQ = holdsTrx ? jtrx : holdsUsdd ? jusdd : jusdt;
+  const lendMarket = holdsTrx ? "jTRX" : holdsUsdd ? "jUSDD" : "jUSDT";
   const amount = new Decimal(needs.amount ?? 0);
   const days = needs.endDate ? daysBetween(needs.startDate, needs.endDate) : 0;
   const reserved = reservedWithinHorizon(needs);
@@ -219,6 +231,8 @@ export function buildMainnetPlans(needs: UserNeeds, inputs: MainnetInputs, now =
   else if (!holdsTrx && !costBasis.trxPerUsdt) warnings.push("TRX→USDT 환산 근거가 없어 순수익을 산정할 수 없습니다.");
   if (reserved.outside.length)
     warnings.push(`운용 기간 밖 지출 ${reserved.outside.map((e) => `${e.date} ${e.amount} ${e.asset}`).join(", ")}은 이번 기간에 확보하지 않습니다.`);
+  warnings.push(...fx.problems);
+  if (fx.conversions.length && reserved.total.gt(amount)) warnings.push(`환전 필요량을 더한 지출 재원(${reserved.total.toDecimalPlaces(6).toFixed()} ${needs.asset})이 보유액보다 커서 운용 가능한 금액이 없습니다.`);
 
   const base = {
     chain,
@@ -232,7 +246,7 @@ export function buildMainnetPlans(needs: UserNeeds, inputs: MainnetInputs, now =
   const commonAssumptions = [
     `지출 재원 ${reserved.total.toFixed()} ${needs.asset}은 처음부터 예치하지 않고 보유합니다.`,
     "조회 시점의 금리가 운용 기간 내내 유지된다고 가정합니다 (보장 아님).",
-    "Energy를 스테이킹하지 않고 TRX 소각으로 지불한다고 가정합니다. 대역폭 무료 한도는 반영하지 않았습니다.",
+    costAssumption(costBasis),
   ];
   const resA = jTokenResources(costBasis, lendMarket);
   const resB = jTokenResources(costBasis, "jUSDD");
@@ -249,6 +263,8 @@ export function buildMainnetPlans(needs: UserNeeds, inputs: MainnetInputs, now =
       step("supply", `JustLend ${lendMarket} 예치`, a, invest, resA.supply, resA.src, q?.address),
       step("withdraw", `만기 인출 ${lendMarket} → ${a}`, a, invest, resA.withdraw, resA.src, q?.address),
     ];
+    // 실행 날짜: 승인·예치는 D+0, 인출은 기간 끝 (Energy 대여는 날짜마다 따로 빌린다)
+    for (const s of steps) if (s.action !== "hold") s.day = s.action === "withdraw" ? days : 0;
     const rate = q?.baseRate ? new Decimal(q.baseRate) : undefined;
     const rt = q?.rateType ?? "APY";
     const y = rate ? baseYield(invest, rate, rt, days) : ZERO;
@@ -293,7 +309,78 @@ export function buildMainnetPlans(needs: UserNeeds, inputs: MainnetInputs, now =
 
   // ---------------- Plan B: USDD 경로 (PSM 전환 → JustLend jUSDD)
   // TRX 보유자는 SunSwap V2로 TRX→USDT 교환 후 같은 경로를 타고, 기간 끝에 USDT→TRX로 되돌린다 (출구 시 풀 가격이 지금과 같다고 가정).
-  const planB = ((): Plan => {
+  // USDD 보유자의 B: USDD → PSM buyGem(tout) → USDT → jUSDT, 만기에 jUSDT 인출 → PSM sellGem(tin) → USDD
+  const planBUsdd = (): Plan => {
+    const title = "B. USDT 경로 (PSM 전환 USDD → USDT → JustLend jUSDT)";
+    const feeIn = psm?.psm ? new Decimal(psm.psm.feeIn) : ZERO;
+    const feeOut = psm?.psm ? new Decimal(psm.psm.feeOut) : ZERO;
+    const usdtIn = investable.div(new Decimal(1).plus(feeOut)).toDecimalPlaces(6, Decimal.ROUND_DOWN);
+    const rate = jusdt?.baseRate ? new Decimal(jusdt.baseRate) : undefined;
+    const rt = jusdt?.rateType ?? "APY";
+    const yieldUsdt = rate ? baseYield(usdtIn, rate, rt, days) : ZERO;
+    const usdtOut = usdtIn.plus(yieldUsdt);
+    const usddBack = usdtOut.mul(new Decimal(1).minus(feeIn));
+    // PSM은 1:1 전환이라 USDT 이자를 그대로 USDD 수익으로 보고, 전환 수수료는 비용으로 뺀다
+    const conversionFees = investable.minus(usdtIn).plus(usdtOut.minus(usddBack));
+    const resT = jTokenResources(costBasis, "jUSDT");
+    const pe = costBasis?.psmEnergy;
+    const psmSrc = pe ? `PSM 최근 성공 거래 ${pe.sampleSize}건 ${statKo(costBasis)}` : "미확인";
+    const steps: PlanStep[] = [
+      step("hold", "지출 재원 보유", "USDD", reserved.total, { energy: 0, bandwidth: 0 }, "-"),
+      step("approve", "USDD 사용 승인 (PSM)", "USDD", investable, TYPICAL_RESOURCES.approve, JUSTLEND_RES_SRC, psm?.address),
+      step("psm_buy", "PSM 전환 USDD → USDT", "USDD", investable, { energy: pe?.buy ?? 0, bandwidth: pe?.bandwidth?.buy ?? TYPICAL_RESOURCES.psm.bandwidth }, psmSrc, psm?.address),
+      step("approve", "USDT 사용 승인 (jUSDT)", "USDT", usdtIn, TYPICAL_RESOURCES.approve, JUSTLEND_RES_SRC, jusdt?.address),
+      step("supply", "JustLend jUSDT 예치", "USDT", usdtIn, resT.supply, resT.src, jusdt?.address),
+      step("withdraw", "만기 인출 jUSDT → USDT", "USDT", usdtOut, resT.withdraw, resT.src, jusdt?.address),
+      step("approve", "USDT 사용 승인 (PSM 출구)", "USDT", usdtOut, TYPICAL_RESOURCES.approve, JUSTLEND_RES_SRC, psm?.address),
+      step("psm_sell", "PSM 전환 USDT → USDD", "USDT", usdtOut, { energy: pe?.sell ?? 0, bandwidth: pe?.bandwidth?.sell ?? TYPICAL_RESOURCES.psm.bandwidth }, psmSrc, psm?.address),
+    ];
+    let exiting = false;
+    for (const x of steps) {
+      if (x.action === "withdraw") exiting = true;
+      if (x.action !== "hold") x.day = exiting ? days : 0;
+    }
+    const costs = stepCosts(steps, costBasis, "USDD", conversionFees);
+    const rw = rewardsFor(jusdt, usdtIn, days, costBasis, jusdt?.underlyingPriceUsd, now, needs.endDate, "USDD");
+    const net = costs.inAsset !== undefined && rate && pe ? yieldUsdt.minus(conversionFees).minus(costs.inAsset).plus(rw.netAdd) : undefined;
+    const blocking: string[] = [];
+    const rbB = riskBlock(needs.riskProfile, "stable_conversion");
+    if (rbB) blocking.push(rbB);
+    const d1 = dataIssues(jusdt, chain, now);
+    const d2 = dataIssues(psm, chain, now);
+    blocking.push(...d1.blocking, ...d2.blocking, ...lendingIssues(jusdt, usdtIn), ...psmIssues(psm, usdtIn));
+    if (!pe) blocking.push("PSM 전환 거래비용(Energy)을 확인하지 못했습니다.");
+    if (investable.lte(0)) blocking.push("지출 재원을 빼면 운용 가능한 금액이 없습니다.");
+    const conditional = [...new Set([...d1.conditional, ...d2.conditional]), ...lendingWarnings(jusdt, usdtIn)];
+    if (net === undefined) conditional.push("비용·환산 근거가 부족해 순수익 산정 불가입니다.");
+    return {
+      ...base,
+      id: `${idPrefix}-B`,
+      key: "B",
+      riskClass: "stable_conversion",
+      title,
+      allocation: { invested: investable.toFixed(), held: reserved.total.toFixed() },
+      steps,
+      baseRate: jusdt?.baseRate,
+      rateType: rt,
+      baseYield: yieldUsdt.toFixed(),
+      rewards: rw.rewards,
+      costs,
+      netReturn: net?.toFixed(),
+      breakEvenDays: rate && costs.inAsset ? breakEvenDays(usdtIn, rate, rt, new Decimal(costs.inAsset).plus(conversionFees))?.toFixed() : undefined,
+      eligibility: blocking.length ? "ineligible" : conditional.length ? "conditional" : "eligible",
+      reasons: [...blocking, ...conditional],
+      risks: ["PSM 출구(USDT 보유량)·진입(부채 한도) 물량 부족", "전환 단계가 많아 거래비용 증가", "금리 변동", "스마트 계약 위험 (PSM + JustLend)"],
+      assumptions: [
+        ...commonAssumptions,
+        `PSM으로 USDD ${investable.toFixed()} → USDT ${usdtIn.toFixed()}(출구 수수료 ${feeOut.mul(100).toFixed()}%), 만기에 USDT ${usdtOut.toDecimalPlaces(4).toFixed()} → USDD ${usddBack.toDecimalPlaces(4).toFixed()}(진입 수수료 ${feeIn.mul(100).toFixed()}%). PSM은 1:1 전환이라 USDT 이자를 그대로 USDD 수익으로 봅니다.`,
+      ],
+      quoteIds: [jusdt, psm].filter(Boolean).map((q) => q!.id),
+      dataModes: modesOf(jusdt, psm),
+    };
+  };
+
+  const planB = holdsUsdd ? planBUsdd() : ((): Plan => {
     const sw = inputs.swap;
     const title = holdsTrx ? "B. USDD 경로 (TRX→USDT 교환 → PSM → JustLend jUSDD)" : "B. USDD 경로 (PSM 전환 → JustLend jUSDD)";
     if (holdsTrx && !sw)
@@ -316,8 +403,8 @@ export function buildMainnetPlans(needs: UserNeeds, inputs: MainnetInputs, now =
     const yieldEval = toEval(yieldUsdd);
     const conversionFees = holdsTrx ? investable.plus(yieldEval).minus(trxBack!) : investable.minus(usddIn).plus(usddOut.minus(usdtBack));
     const pe = costBasis?.psmEnergy;
-    const psmSrc = pe ? `PSM 최근 성공 거래 ${pe.sampleSize}건 실측 최대값` : "미확인";
-    const swapSrc = sw ? (sw.costs.sampleSize ? `SunSwap V2 라우터 최근 성공 거래 ${sw.costs.sampleSize}건 실측 최대값` : "SunSwap V2 교환 비용 (Mainnet 실측값)") : "미확인";
+    const psmSrc = pe ? `PSM 최근 성공 거래 ${pe.sampleSize}건 ${statKo(costBasis)}` : "미확인";
+    const swapSrc = sw ? (sw.costs.sampleSize ? `SunSwap V2 라우터 최근 성공 거래 ${sw.costs.sampleSize}건 ${statKo(costBasis)}` : "SunSwap V2 교환 비용 (Mainnet 실측값)") : "미확인";
     const br = holdsTrx ? sw?.bridge : undefined;
     const steps: PlanStep[] = [
       step("hold", "지출 재원 보유", needs.asset, reserved.total, { energy: 0, bandwidth: 0 }, "-"),
@@ -447,21 +534,33 @@ export function buildMainnetPlans(needs: UserNeeds, inputs: MainnetInputs, now =
     // USDT 보유자는 SunSwap V2로 USDT→TRX 교환 후 스테이킹하고, 기간 끝에 TRX→USDT로 되돌린다 (풀 준비금으로 계산, 라우터 견적과 교차 검증)
     const sw = inputs.swap;
     const rate = q?.baseRate ? new Decimal(q.baseRate) : undefined;
-    const trxIn = holdsTrx ? investable : sw ? swapRoundTrip(sw, investable).trx : undefined;
+    // USDD 보유자는 PSM으로 USDT를 받아(tout) 같은 교환 경로를 타고, 만기에 USDT → PSM(tin) → USDD로 되돌린다
+    const pIn = holdsUsdd && psm?.psm ? new Decimal(psm.psm.feeIn) : ZERO;
+    const pOut = holdsUsdd && psm?.psm ? new Decimal(psm.psm.feeOut) : ZERO;
+    const usdtStart = holdsUsdd ? investable.div(new Decimal(1).plus(pOut)).toDecimalPlaces(6, Decimal.ROUND_DOWN) : investable;
+    const trxIn = holdsTrx ? investable : sw ? swapRoundTrip(sw, usdtStart).trx : undefined;
     const yieldTrx = trxIn && rate ? trxIn.mul(rate).mul(rewardDays).div(365) : ZERO;
-    const rt = !holdsTrx && sw ? swapRoundTrip(sw, investable, yieldTrx) : undefined;
-    // 기본 수익은 풀 중간 가격으로 환산한 보상, 교환 손실(수수료 0.3%×2 + 가격 영향)은 전환 비용으로 따로 뺀다
+    const rt = !holdsTrx && sw ? swapRoundTrip(sw, usdtStart, yieldTrx) : undefined;
+    const backInAsset = rt ? (holdsUsdd ? rt.usdtBack.mul(new Decimal(1).minus(pIn)) : rt.usdtBack) : undefined;
+    // 기본 수익은 풀 중간 가격으로 환산한 보상, 교환·PSM 손실은 전환 비용으로 따로 뺀다
     const yieldInAsset = holdsTrx ? yieldTrx : rt ? yieldTrx.mul(rt.mid) : ZERO;
-    const conversionFees = rt ? rt.loss : ZERO;
+    const conversionFees = rt ? (holdsUsdd ? investable.plus(yieldInAsset).minus(backInAsset!) : rt.loss) : ZERO;
+    const pe = costBasis?.psmEnergy;
     const trxLabel = trxIn ? trxIn.toDecimalPlaces(6, Decimal.ROUND_DOWN) : ZERO;
-    const swapSrc = sw ? `SunSwap V2 라우터 최근 성공 거래 ${sw.costs.sampleSize}건 실측 최대값` : "미확인";
+    const swapSrc = sw ? `SunSwap V2 라우터 최근 성공 거래 ${sw.costs.sampleSize}건 ${statKo(costBasis)}` : "미확인";
     const steps = [
       step("hold", "지출 재원 보유", needs.asset, reserved.total, { energy: 0, bandwidth: 0 }, "-"),
+      ...(holdsUsdd
+        ? [
+            step("approve", "USDD 사용 승인 (PSM)", "USDD", investable, TYPICAL_RESOURCES.approve, JUSTLEND_RES_SRC, psm?.address),
+            step("psm_buy", "PSM 전환 USDD → USDT", "USDD", investable, { energy: pe?.buy ?? 0, bandwidth: pe?.bandwidth?.buy ?? TYPICAL_RESOURCES.psm.bandwidth }, "PSM 실측", psm?.address),
+          ]
+        : []),
       ...(holdsTrx
         ? []
         : [
-            step("approve", `${needs.asset} 사용 승인 (SunSwap V2 라우터)`, needs.asset, investable, TYPICAL_RESOURCES.approve, JUSTLEND_RES_SRC, sw?.router),
-            step("swap", `SunSwap V2 교환 ${needs.asset} → TRX (예상 ${trxLabel.toDecimalPlaces(2).toFixed()} TRX)`, needs.asset, investable, sw?.costs.toTrx ?? { energy: 0, bandwidth: 0 }, swapSrc, sw?.router),
+            step("approve", "USDT 사용 승인 (SunSwap V2 라우터)", "USDT", usdtStart, TYPICAL_RESOURCES.approve, JUSTLEND_RES_SRC, sw?.router),
+            step("swap", `SunSwap V2 교환 USDT → TRX (예상 ${trxLabel.toDecimalPlaces(2).toFixed()} TRX)`, "USDT", usdtStart, sw?.costs.toTrx ?? { energy: 0, bandwidth: 0 }, swapSrc, sw?.router),
           ]),
       step("stake", "TRX 스테이킹 (FreezeBalanceV2)", "TRX", trxLabel, sys(bw?.stake), sysSrc("stake")),
       step("vote", `SR 투표 (${st?.srName ?? "SR 미확인"})`, "TRX", trxLabel, sys(bw?.vote), sysSrc("vote"), st?.srAddress),
@@ -470,18 +569,25 @@ export function buildMainnetPlans(needs: UserNeeds, inputs: MainnetInputs, now =
       step("withdraw", "해제 완료분 인출 (WithdrawExpireUnfreeze)", "TRX", trxLabel, sys(bw?.withdrawExpire), sysSrc("withdrawExpire")),
       ...(holdsTrx
         ? []
-        : [step("swap", `SunSwap V2 교환 TRX → ${needs.asset} (원금+보상)`, "TRX", trxLabel.plus(yieldTrx).toDecimalPlaces(6, Decimal.ROUND_DOWN), sw?.costs.toUsdt ?? { energy: 0, bandwidth: 0 }, swapSrc, sw?.router)]),
+        : [step("swap", "SunSwap V2 교환 TRX → USDT (원금+보상)", "TRX", trxLabel.plus(yieldTrx).toDecimalPlaces(6, Decimal.ROUND_DOWN), sw?.costs.toUsdt ?? { energy: 0, bandwidth: 0 }, swapSrc, sw?.router)]),
+      ...(holdsUsdd && rt
+        ? [
+            step("approve", "USDT 사용 승인 (PSM 출구)", "USDT", rt.usdtBack, TYPICAL_RESOURCES.approve, JUSTLEND_RES_SRC, psm?.address),
+            step("psm_sell", "PSM 전환 USDT → USDD", "USDT", rt.usdtBack, { energy: pe?.sell ?? 0, bandwidth: pe?.bandwidth?.sell ?? TYPICAL_RESOURCES.psm.bandwidth }, "PSM 실측", psm?.address),
+          ]
+        : []),
     ];
     // 실행 날짜: 진입(교환·스테이킹·투표)은 D+0, 해제는 인출일보다 해제 대기만큼 먼저, 해제분 인출·보상 청구·되돌림 교환은 기간 끝
     const unstakeDay = Math.max(0, days - delay);
     let seenSwap = false;
+    let exited = false;
     for (const s of steps) {
       if (s.action === "unstake") s.day = unstakeDay;
       else if (s.action === "withdraw" || s.action === "claim") s.day = days;
-      else if (s.action === "swap") (s.day = seenSwap ? days : 0), (seenSwap = true);
-      else if (s.action !== "hold") s.day = 0;
+      else if (s.action === "swap") (s.day = seenSwap ? days : 0), (seenSwap = true), (exited = seenSwap && s.asset === "TRX");
+      else if (s.action !== "hold") s.day = exited ? days : 0; // 되돌림 교환 뒤의 PSM 출구는 기간 끝
     }
-    const costs = stepCosts(steps, costBasis, holdsTrx ? "TRX" : "USDT", conversionFees);
+    const costs = stepCosts(steps, costBasis, evalAsset, conversionFees);
     // 순수익 = 보상(중간 가격 환산) − 교환 손실 − 거래비용 = 돌려받는 USDT − 넣은 USDT − 거래비용
     const net = costs.inAsset !== undefined && rate && (holdsTrx || rt) ? yieldInAsset.minus(conversionFees).minus(costs.inAsset) : undefined;
     const di = dataIssues(q, chain, now);
@@ -498,7 +604,7 @@ export function buildMainnetPlans(needs: UserNeeds, inputs: MainnetInputs, now =
       rt && net !== undefined && costs.inAsset !== undefined
         ? ["-20", "-10", "10"].map((pct) => ({
             label: `기간 끝 TRX 가격 ${pct.startsWith("-") ? "" : "+"}${pct}%`,
-            netReturn: rt.usdtBack.mul(new Decimal(pct).div(100).plus(1)).minus(investable).minus(costs.inAsset!).toFixed(),
+            netReturn: backInAsset!.mul(new Decimal(pct).div(100).plus(1)).minus(investable).minus(costs.inAsset!).toFixed(),
           }))
         : undefined;
     const rbC = riskBlock(needs.riskProfile, holdsTrx ? "stable" : "volatile");
@@ -535,7 +641,7 @@ export function buildMainnetPlans(needs: UserNeeds, inputs: MainnetInputs, now =
         holdsTrx
           ? "TRX를 그대로 스테이킹합니다."
           : rt
-            ? `SunSwap V2 풀(USDT ${new Decimal(sw!.reserveUsdt).toDecimalPlaces(0).toFixed()} / TRX ${new Decimal(sw!.reserveTrx).toDecimalPlaces(0).toFixed()}) 기준 ${investable.toFixed()} USDT → ${trxLabel.toDecimalPlaces(4).toFixed()} TRX. 기간 끝 풀 가격이 지금과 같다고 보고 ${rt.usdtBack.toDecimalPlaces(4).toFixed()} USDT로 되돌립니다. 교환 손실(수수료 0.3%×2 + 가격 영향) ${rt.loss.toDecimalPlaces(4).toFixed()} USDT는 전환 비용으로 뺐습니다.`
+            ? `${holdsUsdd ? `PSM으로 USDD ${investable.toFixed()} → USDT ${usdtStart.toFixed()}, ` : ""}SunSwap V2 풀(USDT ${new Decimal(sw!.reserveUsdt).toDecimalPlaces(0).toFixed()} / TRX ${new Decimal(sw!.reserveTrx).toDecimalPlaces(0).toFixed()}) 기준 ${usdtStart.toFixed()} USDT → ${trxLabel.toDecimalPlaces(4).toFixed()} TRX. 기간 끝 풀 가격이 지금과 같다고 보고 ${rt.usdtBack.toDecimalPlaces(4).toFixed()} USDT로 되돌립니다. 교환 손실(수수료 0.3%×2 + 가격 영향) ${rt.loss.toDecimalPlaces(4).toFixed()} USDT는 전환 비용으로 뺐습니다.`
             : "교환 견적이 없어 계산하지 않았습니다.",
       ],
       quoteIds: q ? [q.id] : [],
@@ -567,16 +673,19 @@ export function buildMainnetPlans(needs: UserNeeds, inputs: MainnetInputs, now =
   const plans = [planA, planA2, planB, planC, planL, hold];
   const rec = recommend(plans, needs.riskProfile);
   rec.plan.recommended = true;
+  const stakeNote = stakeNeedNote(rec.plan, costBasis);
+  if (stakeNote) warnings.push(stakeNote);
 
   // 차별점 비교: 지출 일정·비용을 무시하고 최고 APY에 전액 예치했다면
-  const naive = naiveComparison(needs, amount, days, holdsTrx ? [jtrx] : [jusdt, jusdd], costBasis, reserved.inside.length);
+  const naive = naiveComparison(needs, amount, days, holdsTrx ? [jtrx] : holdsUsdd ? [jusdd] : [jusdt, jusdd], costBasis, reserved.inside.length);
 
   return {
     id: `${idPrefix}-${now.getTime()}`,
     chain,
     createdAt: now.toISOString(),
     engineVersion: ENGINE_VERSION,
-    needs,
+    needs: needsIn,
+    conversions: fx.conversions.length ? fx.conversions : undefined,
     reserved: {
       total: reserved.total.toFixed(),
       expensesInHorizon: reserved.expenses.toFixed(),
@@ -587,7 +696,7 @@ export function buildMainnetPlans(needs: UserNeeds, inputs: MainnetInputs, now =
     plans,
     recommendation: { planId: rec.plan.id, reason: rec.reason },
     naiveComparison: naive,
-    quotes: (holdsTrx ? [jtrx, staking, jusdd, psm] : [jusdt, jusdd, psm, staking]).filter(Boolean) as ProductQuote[],
+    quotes: (holdsTrx ? [jtrx, staking, jusdd, psm] : holdsUsdd ? [jusdd, jusdt, psm, staking] : [jusdt, jusdd, psm, staking]).filter(Boolean) as ProductQuote[],
     screening: buildScreening(needs, investable, inputs.markets ?? marketsFromQuotes(holdsTrx ? [jtrx] : [jusdt, jusdd]), { jusdd, staking, plans, usddSavings: inputs.usddSavings }),
     costBasis,
     warnings,
@@ -692,27 +801,31 @@ export interface NileInputs {
 }
 
 /** Nile jTRX 거래 자원: 체인 실측값이 있으면 쓰고, 없으면 JustLend MCP 일반값 */
-export function nileResources(costBasis?: Pick<CostBasis, "jtrxEnergy">) {
+export function nileResources(costBasis?: Pick<CostBasis, "jtrxEnergy" | "costMode">) {
   const m = costBasis?.jtrxEnergy;
   return m
     ? {
         depositRes: { energy: m.mint, bandwidth: m.bandwidth?.mint ?? TYPICAL_RESOURCES.supply_trx.bandwidth },
         withdrawRes: { energy: m.redeem, bandwidth: m.bandwidth?.redeem ?? TYPICAL_RESOURCES.withdraw.bandwidth },
         partialRes: { energy: m.redeemUnderlying, bandwidth: m.bandwidth?.redeemUnderlying ?? TYPICAL_RESOURCES.withdraw.bandwidth },
-        resSrc: `Nile jTRX 최근 성공 거래 ${m.sampleSize}건 실측 최대값`,
+        resSrc: `Nile jTRX 최근 성공 거래 ${m.sampleSize}건 ${statKo(costBasis)}`,
       }
     : { depositRes: TYPICAL_RESOURCES.supply_trx, withdrawRes: TYPICAL_RESOURCES.withdraw, partialRes: TYPICAL_RESOURCES.withdraw, resSrc: JUSTLEND_RES_SRC };
 }
 
 /** Nile jTRX 두 배분안. 실제 잔고·수수료 재원에 맞춰 예치액을 줄인다. */
 // 계획 ID는 계산마다 달라야 한다: 실행 기록(계획 ID + 단계 번호)이 다시 계산한 새 계획에 달라붙지 않게
-export function buildNilePlans(needs: UserNeeds, inputs: NileInputs, now = new Date(), idPrefix = `n${now.getTime().toString(36)}`): Omit<PlanningResult, "explanation"> {
+export function buildNilePlans(needsIn: UserNeeds, inputs: NileInputs, now = new Date(), idPrefix = `n${now.getTime().toString(36)}`): Omit<PlanningResult, "explanation"> {
   const { jtrx, costBasis } = inputs;
+  // USDT·USDD 지출은 오늘 환전할 TRX 필요량으로 바꾼다 (Nile은 브리지 PSM 경로 견적)
+  const fx = convertExpenses({ ...needsIn, asset: "TRX" }, inputs);
+  const needs = fx.needs;
   const days = needs.endDate ? daysBetween(needs.startDate, needs.endDate) : 30;
   const total = new Decimal(inputs.walletBalanceTrx ?? needs.amount ?? 0);
   const reserved = reservedWithinHorizon(needs);
   const warnings: string[] = [];
   if (!inputs.walletBalanceTrx) warnings.push("지갑이 연결되지 않아 입력한 보유액을 가정으로 사용했습니다. 실행 전에 실제 잔고로 다시 계산합니다.");
+  warnings.push(...fx.problems);
 
   const { depositRes, withdrawRes, resSrc } = nileResources(costBasis);
   const feeBudget = costBasis
@@ -822,6 +935,8 @@ export function buildNilePlans(needs: UserNeeds, inputs: NileInputs, now = new D
   const all = [...plans, ...fromEngine, hold];
   const rec = recommend(all, needs.riskProfile);
   rec.plan.recommended = true;
+  const stakeNote = stakeNeedNote(rec.plan, costBasis);
+  if (stakeNote) warnings.push(stakeNote);
   if (rec.plan === hold) warnings.push("모든 계획의 순수익이 0 이하라 경제적으로는 보유가 유리합니다. 테스트넷 흐름을 확인하려면 원하는 계획을 골라 실행할 수 있습니다 (예상 손익은 표에 그대로 표시).");
 
   return {
@@ -829,7 +944,8 @@ export function buildNilePlans(needs: UserNeeds, inputs: NileInputs, now = new D
     chain: "nile",
     createdAt: now.toISOString(),
     engineVersion: ENGINE_VERSION,
-    needs,
+    needs: needsIn,
+    conversions: fx.conversions.length ? fx.conversions : undefined,
     reserved: {
       total: reserved.total.toFixed(),
       expensesInHorizon: reserved.expenses.toFixed(),

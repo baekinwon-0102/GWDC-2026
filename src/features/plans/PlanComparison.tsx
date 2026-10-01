@@ -5,7 +5,9 @@ import type { Plan, PlanningResult, ScreeningRow } from "../../../shared/schemas
 import { ChainBadge, EligibilityBadge, ModeBadge, Money, pct, SourceLine, Tabs, timeKo, Tip, WarnBadge } from "../common";
 import { riskLabel } from "../../../shared/needs";
 import AgentPanel from "../agent/AgentPanel";
-import { AllocationBar, LadderTimeline, PlanCard, planSegments } from "../ui";
+import { api, fillExplanation } from "../../lib/api";
+import { COST_MODE_KO, ENERGY_MODE_KO, type CostMode, type EnergyMode } from "../../../shared/costmode";
+import { AllocationBar, LadderTimeline, PlanCard, planSegments, TrxAmount, trxPer } from "../ui";
 
 type Props = {
   state: PersistedState;
@@ -50,20 +52,20 @@ function PortfolioCard({ result }: { result: PlanningResult }) {
         <div className="spacer" />
         {pf.totalValueUsdt && (
           <span className="small">
-            총 가치 ≈ <strong><Money v={pf.totalValueUsdt} dp={2} /> USDT</strong>
+            총 가치 ≈ <strong><TrxAmount v={pf.totalValueUsdt} asset="USDT" basis={result.costBasis} /></strong>
           </span>
         )}
         <span className="small">
-          추천 계획 순수익 합계 <strong>{pf.totalNetUsdt !== undefined ? <><Money v={pf.totalNetUsdt} dp={4} signed /> USDT</> : "산정 불가"}</strong>
+          추천 계획 순수익 합계 <strong><TrxAmount v={pf.totalNetUsdt} asset="USDT" basis={result.costBasis} dp={4} signed /></strong>
         </span>
       </div>
       <div style={{ marginTop: 14 }}>
         <AllocationBar
           segments={pf.allocation.map((a) => {
-            const px = a.share && pf.totalValueUsdt ? Number(a.share) * Number(pf.totalValueUsdt) : Number(a.amount);
+            const px = a.share && pf.totalValueUsdt ? Number(a.share) * Number(pf.totalValueUsdt) * (trxPer("USDT", result.costBasis) ?? 1) : Number(a.amount);
             return { label: `${a.asset} ${a.product}`, amount: Math.round(px * 100) / 100, sub: `${Number(a.amount).toLocaleString()} ${a.asset}` };
           })}
-          unit="USDT"
+          unit={trxPer("USDT", result.costBasis) ? "TRX" : "USDT"}
         />
       </div>
       <div className="plan-grid">
@@ -76,7 +78,7 @@ function PortfolioCard({ result }: { result: PlanningResult }) {
                 {p.valueUsdt && p.asset !== "USDT" && <span className="tiny muted"> (≈ {Number(p.valueUsdt).toLocaleString()} USDT)</span>}
               </div>
               <div className="pcard-net">
-                <Money v={rec.netReturn} dp={2} signed /> <small>{p.asset}</small>
+                <TrxAmount v={rec.netReturn} asset={p.asset} basis={result.costBasis} signed />
               </div>
               <div className="pcard-lines">
                 <div>추천: {rec.title}</div>
@@ -138,6 +140,8 @@ function PlanComparisonBody({ state, update, result, goNeeds, goNile }: Props) {
         </button>
       </div>
 
+      <CostOptions state={state} update={update} disabled={stale} />
+
       {stale && (
         <div className="callout amber small">
           요구사항이 이 분석 이후 바뀌었습니다 (분석 v{result.needs.version} → 현재 v{state.needs.version}). 요구 분석에서 다시 확인하면 새 계획을 계산합니다.
@@ -153,9 +157,14 @@ function PlanComparisonBody({ state, update, result, goNeeds, goNile }: Props) {
             <div className="big">{rec.title}</div>
           </div>
           <div>
-            <div className="tiny muted">예상 순수익</div>
+            <div className="tiny muted">
+              예상 순수익{" "}
+              {asset !== "TRX" && trxPer(asset, result.costBasis) && (
+                <Tip text={`모든 보유 자산의 결과를 같은 단위로 비교하도록 TRX로 환산해 보입니다. 1 ${asset} = ${trxPer(asset, result.costBasis)!.toFixed(4)} TRX (JustLend 오라클, 조회 시점 가격). 단위만 바꾸는 것이라 계획 순위는 같습니다.`} />
+              )}
+            </div>
             <div className="big">
-              <Money v={rec.netReturn} asset={asset} dp={4} signed />
+              <TrxAmount v={rec.netReturn} asset={asset} basis={result.costBasis} dp={4} signed />
             </div>
           </div>
           {rec.key === "HOLD" && <span className="badge red">거래 보류</span>}
@@ -172,6 +181,11 @@ function PlanComparisonBody({ state, update, result, goNeeds, goNile }: Props) {
           <strong><Money v={result.investable} dp={0} /> {asset}</strong> · {result.needs.startDate} ~ {result.needs.endDate} ({result.plans[0].horizonDays}일) · {riskLabel(result.needs.riskProfile)}
           {asset === "USDT" && ` · USDD 위험 ${result.needs.acceptUsddRisk ? "수용" : "미수용"}`}
         </div>
+        {result.conversions?.map((c) => (
+          <div key={c.expenseId} className="tiny muted">
+            지출 환전: {c.date} {c.need.amount} {c.need.asset} ← 오늘 {Number(c.pay.amount).toLocaleString()} {c.pay.asset}를 환전해 보유 ({c.route}, 환전 거래비용 ≈ {Number(c.costTrx).toFixed(2)} TRX 포함)
+          </div>
+        ))}
       </div>
 
       {/* 2. 핵심 아이디어: 돈이 필요한 날짜별 배분 (인출일별 분산) */}
@@ -183,10 +197,10 @@ function PlanComparisonBody({ state, update, result, goNeeds, goNile }: Props) {
             <Tip text="곧 쓸 돈은 짧게, 오래 둘 돈은 오래 둘수록 이익인 곳에 넣습니다. 구간마다 가능한 모든 조합(보유·예치·USDD 경로·스테이킹)의 순수익을 코드가 계산해 합계가 가장 큰 배분을 골랐습니다." />
             <div className="spacer" />
             <span className="small">
-              예상 순수익 <strong><Money v={ladderPlan.netReturn} asset={asset} dp={2} signed /></strong>
+              예상 순수익 <strong><TrxAmount v={ladderPlan.netReturn} asset={asset} basis={result.costBasis} signed /></strong>
             </span>
           </div>
-          <LadderTimeline plan={ladderPlan} asset={asset} />
+          <LadderTimeline plan={ladderPlan} asset={asset} basis={result.costBasis} />
           <details style={{ marginTop: 10 }}>
             <summary className="small muted">구간별 이유 · 다른 선택지 · 날짜별 거래</summary>
             <LadderCard plan={ladderPlan} asset={asset} />
@@ -202,7 +216,7 @@ function PlanComparisonBody({ state, update, result, goNeeds, goNile }: Props) {
         </div>
         <div className="plan-grid">
           {others.map((p) => (
-            <PlanCard key={p.id} plan={p} asset={asset} selected={state.selectedPlanId === p.id} onSelect={() => update((s) => ({ ...s, selectedPlanId: p.id }))} disabled={stale} />
+            <PlanCard key={p.id} plan={p} asset={asset} basis={result.costBasis} selected={state.selectedPlanId === p.id} onSelect={() => update((s) => ({ ...s, selectedPlanId: p.id }))} disabled={stale} />
           ))}
         </div>
         {excluded.length > 0 && (
@@ -240,7 +254,7 @@ function PlanComparisonBody({ state, update, result, goNeeds, goNile }: Props) {
             </tr>
           </thead>
           <tbody>
-            <Row label="예상 순수익" plans={shown} cell={(p) => <strong><Money v={p.netReturn} dp={4} signed /></strong>} />
+            <Row label="예상 순수익" plans={shown} cell={(p) => <strong><TrxAmount v={p.netReturn} asset={asset} basis={result.costBasis} dp={4} signed /></strong>} />
             <Row label="예치 / 보유" plans={shown} cell={(p) => `${p.allocation.invested} / ${p.allocation.held}`} />
             <Row label="손익분기" plans={shown} cell={(p) => (p.key === "HOLD" ? "-" : p.breakEvenDays ? `${Math.ceil(Number(p.breakEvenDays)).toLocaleString()}일` : "산정 불가")} />
             <Row label="위험 등급" plans={shown} cell={(p) => (p.riskClass ? RISK_CLASS[p.riskClass][0] : "-")} />
@@ -311,7 +325,7 @@ function PlanComparisonBody({ state, update, result, goNeeds, goNile }: Props) {
         needs={result.needs}
         intro={{
           text: result.explanation.text,
-          badge: result.explanation.source === "llm" ? `${result.explanation.provider} · ${result.explanation.model}` : "템플릿 대체",
+          badge: result.explanation.pending ? "AI 설명 생성 중… (지금은 템플릿)" : result.explanation.source === "llm" ? `${result.explanation.provider} · ${result.explanation.model}` : "템플릿 대체",
           note: result.explanation.fallbackReason,
         }}
         previousRates={state.analyses.length > 1 ? state.analyses[state.analyses.length - 2].quotes.map((q) => ({ market: q.market, baseRate: q.baseRate })) : undefined}
@@ -330,7 +344,7 @@ function PlanComparisonBody({ state, update, result, goNeeds, goNile }: Props) {
             label: "최고 APY만 골랐다면",
             body: result.naiveComparison ? (
               <div className="small">
-                {result.naiveComparison.title} → 예상 순수익 <Money v={result.naiveComparison.netReturn} dp={4} signed /> {asset}. {result.naiveComparison.description}
+                {result.naiveComparison.title} → 예상 순수익 <TrxAmount v={result.naiveComparison.netReturn} asset={asset} basis={result.costBasis} dp={4} signed />. {result.naiveComparison.description}
               </div>
             ) : null,
           },
@@ -612,3 +626,57 @@ function Row({ label, plans, cell }: { label: string; plans: Plan[]; cell: (p: P
   );
 }
 
+/** 비용 가정: Energy 조달 방식과 비용 기준을 바꿔 같은 조건으로 다시 계산한다 (새 분석 버전으로 쌓임) */
+function CostOptions({ state, update, disabled }: { state: PersistedState; update: Update; disabled: boolean }) {
+  const n = state.needs;
+  const [energy, setEnergy] = useState<EnergyMode>(n.energySource ?? "burn");
+  const [cost, setCost] = useState<CostMode>(n.costBasisMode ?? "max");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string>();
+  const changed = energy !== (n.energySource ?? "burn") || cost !== (n.costBasisMode ?? "max");
+  async function apply() {
+    const next = { ...n, energySource: energy, costBasisMode: cost, version: n.version + 1 };
+    setBusy(true);
+    setErr(undefined);
+    try {
+      const r = await api.plans(next);
+      update((s) => ({ ...s, needs: next, confirmedVersion: next.version, convState: "comparing", analyses: [...s.analyses, r] }));
+      fillExplanation(r, update);
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="card collapsed-line">
+      <strong>비용 가정</strong>
+      <Tip text="Energy 조달: 소각 = TRX를 태워 지불 / 스테이킹 = Energy용으로 스테이킹해 둔 TRX로 충당(필요한 TRX를 경고로 알려 줌) / 대여 = JustLend Energy 대여로 날짜마다 1시간 빌림(대여율·수수료는 계약에서 읽음). 비용 기준: 실측 최대값(보수적) / 실측 중앙값 / 공식 일반값(JustLend MCP)." />
+      <label className="small">
+        Energy{" "}
+        <select value={energy} onChange={(e) => setEnergy(e.target.value as EnergyMode)}>
+          {(Object.keys(ENERGY_MODE_KO) as EnergyMode[]).map((k) => (
+            <option key={k} value={k}>
+              {ENERGY_MODE_KO[k]}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="small">
+        비용 기준{" "}
+        <select value={cost} onChange={(e) => setCost(e.target.value as CostMode)}>
+          {(Object.keys(COST_MODE_KO) as CostMode[]).map((k) => (
+            <option key={k} value={k}>
+              {COST_MODE_KO[k]}
+            </option>
+          ))}
+        </select>
+      </label>
+      <div className="spacer" />
+      {err && <span className="tiny neg">{err}</span>}
+      <button className="btn small teal" disabled={!changed || busy || disabled} onClick={apply}>
+        {busy ? "다시 계산 중…" : "이 가정으로 다시 계산"}
+      </button>
+    </div>
+  );
+}

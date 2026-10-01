@@ -47,6 +47,11 @@ export function buildScreening(needs: UserNeeds, investable: Decimal, markets: M
       analyzedAs = ["A", "A2"].filter((k) => planOf(k)).map(label).join(", ");
       const b = planOf("A");
       if (b?.eligibility === "ineligible") reasons.push(...b.reasons.slice(0, 1));
+    } else if (asset === "USDD" && m.symbol === "USDT") {
+      category = "psm_route";
+      analyzedAs = planOf("B") ? label("B") : undefined;
+      const b = planOf("B");
+      if (b?.eligibility === "ineligible") reasons.push(...b.reasons.slice(0, 2));
     } else if (m.symbol === "USDD") {
       category = "psm_route";
       analyzedAs = planOf("B") ? label("B") : undefined;

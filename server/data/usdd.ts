@@ -94,7 +94,7 @@ export async function fetchPsm(chain: "mainnet" | "nile" = "mainnet"): Promise<P
 export async function psmEnergyFromRecentTxs(chain: "mainnet" | "nile" = "mainnet"): Promise<NonNullable<CostBasis["psmEnergy"]> | undefined> {
   const m = await measureContractCosts(chain, PSM_CFG[chain].psm, { sell: USDD.sellGemSelector, buy: USDD.buyGemSelector }, 50);
   if (!m.sell || !m.buy) return undefined;
-  return { sell: m.sell.energy, buy: m.buy.energy, sampleSize: m.sell.sampleSize + m.buy.sampleSize, bandwidth: { sell: m.sell.bandwidth, buy: m.buy.bandwidth } };
+  return { sell: m.sell.energy, buy: m.buy.energy, sampleSize: m.sell.sampleSize + m.buy.sampleSize, bandwidth: { sell: m.sell.bandwidth, buy: m.buy.bandwidth }, median: { sell: m.sell.median.energy, buy: m.buy.median.energy } };
 }
 
 // ---------------------------------------------------------------- USDD 저축 (sUSDD)

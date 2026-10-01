@@ -111,8 +111,8 @@ function normalize(v: string): string {
 }
 
 /** 같은 자산은 합치고 0 이하는 뺀다 */
-function mergeHoldings(hs: { asset: "USDT" | "TRX"; amount: string }[]): Holding[] {
-  const m = new Map<"USDT" | "TRX", Decimal>();
+function mergeHoldings(hs: Holding[]): Holding[] {
+  const m = new Map<Holding["asset"], Decimal>();
   for (const h of hs) m.set(h.asset, (m.get(h.asset) ?? new Decimal(0)).plus(h.amount));
   return [...m.entries()].filter(([, a]) => a.gt(0)).map(([asset, a]) => ({ asset, amount: a.toFixed() }));
 }
@@ -133,7 +133,8 @@ export function needsForHolding(n: UserNeeds, h: Holding): UserNeeds {
     asset: h.asset,
     amount: h.amount,
     holdings: undefined,
-    expenses: n.expenses.filter((e) => e.asset === h.asset),
+    // 그 자산의 지출 + (대표 자산이면) 어느 보유 자산과도 다른 자산의 지출 (환전해서 냄)
+    expenses: n.expenses.filter((e) => e.asset === h.asset || (h.asset === n.asset && !holdingsOf(n).some((x) => x.asset === e.asset))),
     bufferAmount: h.asset === n.asset ? n.bufferAmount : "0",
     acceptUsddRisk: n.acceptUsddRisk,
   };
@@ -146,8 +147,8 @@ export function missingFields(n: UserNeeds): MissingField[] {
   if (!n.expensesStated) m.push("expenses");
   if (n.bufferAmount === undefined) m.push("bufferAmount");
   if (!n.riskProfile) m.push("riskProfile");
-  // USDD 경로(계획 B)는 USDT 보유자와 (TRX→USDT 교환을 거치는) TRX 보유자 모두 해당된다
-  if (n.acceptUsddRisk === undefined) m.push("acceptUsddRisk");
+  // USDD 경로(계획 B)는 USDT·TRX 보유자가 USDD를 새로 들고 가는 경로라 동의를 묻는다 (USDD만 가진 사람은 이미 USDD 위험을 지고 있음)
+  if (n.acceptUsddRisk === undefined && holdingsOf(n).some((h) => h.asset !== "USDD")) m.push("acceptUsddRisk");
   return m;
 }
 
@@ -156,10 +157,9 @@ export function inputProblems(n: UserNeeds): string[] {
   const p: string[] = [];
   if (n.endDate && daysBetween(n.startDate, n.endDate) <= 0) p.push("운용 종료일이 시작일보다 뒤여야 합니다.");
   const held = holdingsOf(n);
-  const heldAssets = held.map((h) => h.asset as string);
   for (const e of n.expenses) {
-    if (held.length && !heldAssets.includes(e.asset))
-      p.push(`${e.date} 지출(${e.amount} ${e.asset})은 보유하지 않은 자산입니다. 보유 자산(${heldAssets.join("·")}) 중 하나로 입력해 주세요.`);
+    // 보유하지 않은 자산의 지출은 환전해서 낸다 (USDT·TRX·USDD만 지원)
+    if (!["USDT", "TRX", "USDD"].includes(e.asset)) p.push(`${e.date} 지출(${e.amount} ${e.asset})은 지원하지 않는 자산입니다. USDT·TRX·USDD 중 하나로 입력해 주세요.`);
     if (daysBetween(n.startDate, e.date) < 0) p.push(`${e.date} 지출이 오늘보다 이전입니다.`);
   }
   if (n.endDate) {
@@ -183,7 +183,7 @@ export function reservedWithinHorizon(n: UserNeeds) {
 }
 
 const QUESTIONS: Record<MissingField, string> = {
-  amount: "운용할 자산과 금액을 알려 주세요. 예: \"1,000 USDT\", \"10,000 TRX\", 여러 자산이면 \"USDT 5,000과 TRX 20,000\"",
+  amount: "운용할 자산과 금액을 알려 주세요. 예: \"1,000 USDT\", \"10,000 TRX\", \"2,000 USDD\", 여러 자산이면 \"USDT 5,000과 TRX 20,000\"",
   endDate: "얼마 동안 운용할 계획인가요? 예: \"30일\" 또는 종료 날짜",
   expenses: "운용 기간 중 예정된 지출이 있나요? 날짜와 금액을 알려 주세요. 예: \"7일 뒤 200 USDT\" (없으면 \"지출 없음\")",
   bufferAmount: "지출 외에 따로 남겨 둘 비상 여유액이 있나요? 없으면 \"0\"이라고 답해 주세요.",

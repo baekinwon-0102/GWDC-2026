@@ -10,6 +10,7 @@ import { CALL_ACTION_KO, TX_KIND_KO, type ActionPreview, type CallAction, type C
 import { computeStakingAdjustment, type NileAdjustment } from "../../../shared/adjust";
 import { ModeBadge, pct, SourceLine, Stepper, timeKo, Tip, WarnBadge } from "../common";
 import { Modal, PlanCard, ProgressDots } from "../ui";
+import { COST_MODE_KO, ENERGY_MODE_KO, type CostMode, type EnergyMode } from "../../../shared/costmode";
 
 const FEE_LIMIT_SUN = 50_000_000n; // 50 TRX 상한
 const PREVIEW_TTL_MS = 3 * 60 * 1000;
@@ -84,7 +85,10 @@ export default function NileExecution({ state, update, health, notify, goLog }: 
   /** USDD 경로(계획 B: TRX→USDT 교환 → PSM → jUSDD)의 USDD 가격 위험 수용 여부. 기본은 감수하지 않음 */
   const [usddRisk, setUsddRisk] = useState(false);
   /** 운용 중 지출 (D+일수, TRX). 인출일별 분산(L)이 이 날짜로 구간을 나눈다 */
-  const [exps, setExps] = useState<{ day: string; amount: string }[]>([{ day: "", amount: "" }]);
+  const [exps, setExps] = useState<{ day: string; amount: string; asset?: string }[]>([{ day: "", amount: "" }]);
+  /** 비용 가정: Energy 조달 방식과 비용 기준 */
+  const [energySrc, setEnergySrc] = useState<EnergyMode>("burn");
+  const [costMode, setCostMode] = useState<CostMode>("max");
   const [inputMode, setInputMode] = useState<"chat" | "form">("chat");
   const [editNeeds, setEditNeeds] = useState(false);
   const [walletOpen, setWalletOpen] = useState(false);
@@ -99,7 +103,7 @@ export default function NileExecution({ state, update, health, notify, goLog }: 
       days: d.endDate ? String(daysBetween(d.startDate, d.endDate)) : f.days,
       reserve: d.bufferAmount ?? f.reserve,
     }));
-    if (d.expensesStated) setExps(d.expenses.length ? d.expenses.map((e) => ({ day: String(daysBetween(d.startDate, e.date)), amount: e.amount })) : [{ day: "", amount: "" }]);
+    if (d.expensesStated) setExps(d.expenses.length ? d.expenses.map((e) => ({ day: String(daysBetween(d.startDate, e.date)), amount: e.amount, asset: e.asset })) : [{ day: "", amount: "" }]);
     if (d.riskProfile) setRisk(d.riskProfile);
     if (d.acceptUsddRisk !== undefined) setUsddRisk(d.acceptUsddRisk);
   }
@@ -193,7 +197,9 @@ export default function NileExecution({ state, update, health, notify, goLog }: 
       amount: new Decimal(form.total || 0).toFixed(),
       startDate: today,
       endDate: addDays(today, Number(form.days) || 30),
-      expenses: validExps.map((e, i) => ({ id: `nx${i}`, date: addDays(today, Number(e.day)), amount: new Decimal(e.amount).toFixed(), asset: "TRX", label: `D+${e.day} 지출` })),
+      expenses: validExps.map((e, i) => ({ id: `nx${i}`, date: addDays(today, Number(e.day)), amount: new Decimal(e.amount).toFixed(), asset: e.asset ?? "TRX", label: `D+${e.day} 지출` })),
+      energySource: energySrc,
+      costBasisMode: costMode,
       expensesStated: true,
       bufferAmount: new Decimal(form.reserve || 0).toFixed(),
       riskProfile: risk,
@@ -1031,8 +1037,8 @@ export default function NileExecution({ state, update, health, notify, goLog }: 
           <strong>2. 조건</strong>
           <span>
             {nile.needs?.amount} TRX · {nile.needs?.endDate ? daysBetween(nile.needs.startDate, nile.needs.endDate) : "-"}일 · 여유 {nile.needs?.bufferAmount} TRX · 지출{" "}
-            {nile.needs?.expenses.length ? nile.needs.expenses.map((e) => `D+${daysBetween(nile.needs!.startDate, e.date)} ${e.amount}`).join(", ") : "없음"} ·{" "}
-            {RISK_OPTIONS.find(([v]) => v === nile.needs?.riskProfile)?.[1]} · USDD 위험 {nile.needs?.acceptUsddRisk ? "감수" : "감수 안 함"}
+            {nile.needs?.expenses.length ? nile.needs.expenses.map((e) => `D+${daysBetween(nile.needs!.startDate, e.date)} ${e.amount} ${e.asset}`).join(", ") : "없음"} ·{" "}
+            {RISK_OPTIONS.find(([v]) => v === nile.needs?.riskProfile)?.[1]} · USDD 위험 {nile.needs?.acceptUsddRisk ? "감수" : "감수 안 함"} · Energy {ENERGY_MODE_KO[nile.needs?.energySource ?? "burn"]} · {COST_MODE_KO[nile.needs?.costBasisMode ?? "max"]}
           </span>
           <div className="spacer" />
           <button className="btn small ghost" onClick={() => setEditNeeds(true)}>
@@ -1083,8 +1089,8 @@ export default function NileExecution({ state, update, health, notify, goLog }: 
         </div>
         <div className="row small" style={{ marginTop: 8 }}>
           <span className="muted">
-            반영된 조건: {form.total} TRX{wallet && obs ? " (지갑 잔고)" : ""} · {form.days}일 · 여유 {form.reserve} · 지출 {validExps.length ? validExps.map((e) => `D+${e.day} ${e.amount}`).join(", ") : "없음"} ·{" "}
-            {RISK_OPTIONS.find(([v]) => v === risk)?.[1]} · USDD 위험 {usddRisk ? "감수" : "감수 안 함"}
+            반영된 조건: {form.total} TRX{wallet && obs ? " (지갑 잔고)" : ""} · {form.days}일 · 여유 {form.reserve} · 지출 {validExps.length ? validExps.map((e) => `D+${e.day} ${e.amount} ${e.asset ?? "TRX"}`).join(", ") : "없음"} ·{" "}
+            {RISK_OPTIONS.find(([v]) => v === risk)?.[1]} · USDD 위험 {usddRisk ? "감수" : "감수 안 함"} · Energy {ENERGY_MODE_KO[energySrc]}
           </span>
           <div className="spacer" />
           <button className="btn teal small" onClick={makePlans} disabled={busy === "plans" || expsInvalid || !/^\d+(\.\d+)?$/.test(form.total) || !/^\d+$/.test(form.days) || !/^\d+(\.\d+)?$/.test(form.reserve)}>
@@ -1134,6 +1140,26 @@ export default function NileExecution({ state, update, health, notify, goLog }: 
               <option value="y">감수</option>
             </select>
           </label>
+          <label className="field">
+            Energy 조달 <Tip text="소각 = TRX를 태워 지불 / 스테이킹 = Energy용으로 스테이킹해 둔 TRX로 충당 / 대여 = JustLend Energy 대여(날짜마다 1시간). Nile 대여 단가를 못 읽으면 소각으로 계산합니다." />
+            <select value={energySrc} onChange={(e) => setEnergySrc(e.target.value as EnergyMode)}>
+              {(Object.keys(ENERGY_MODE_KO) as EnergyMode[]).map((k) => (
+                <option key={k} value={k}>
+                  {ENERGY_MODE_KO[k]}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field">
+            비용 기준
+            <select value={costMode} onChange={(e) => setCostMode(e.target.value as CostMode)}>
+              {(Object.keys(COST_MODE_KO) as CostMode[]).map((k) => (
+                <option key={k} value={k}>
+                  {COST_MODE_KO[k]}
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
         <div className="small" style={{ marginTop: 10 }}>
           운용 중 지출 (인출일별 분산이 이 날짜로 구간을 나눕니다)
@@ -1145,8 +1171,18 @@ export default function NileExecution({ state, update, health, notify, goLog }: 
               <input value={e.day} placeholder="예: 7" onChange={(ev) => setExps(exps.map((x, j) => (j === i ? { ...x, day: ev.target.value } : x)))} />
             </label>
             <label className="field">
-              금액 (TRX)
+              금액
               <input value={e.amount} placeholder="예: 20" onChange={(ev) => setExps(exps.map((x, j) => (j === i ? { ...x, amount: ev.target.value } : x)))} />
+            </label>
+            <label className="field">
+              자산 <Tip text="TRX가 아닌 자산(USDT·USDD)으로 낼 지출은 오늘 환전할 TRX 필요량으로 확보합니다 (SunSwap + PSM 경로 견적)." />
+              <select value={e.asset ?? "TRX"} onChange={(ev) => setExps(exps.map((x, j) => (j === i ? { ...x, asset: ev.target.value } : x)))}>
+                {["TRX", "USDT", "USDD"].map((a) => (
+                  <option key={a} value={a}>
+                    {a}
+                  </option>
+                ))}
+              </select>
             </label>
             {exps.length > 1 && (
               <button className="btn ghost small" onClick={() => setExps(exps.filter((_, j) => j !== i))}>
@@ -1186,6 +1222,11 @@ export default function NileExecution({ state, update, health, notify, goLog }: 
           <p className="small muted" style={{ margin: "6px 0 0" }}>
             {result.recommendation.reason}
           </p>
+          {result.conversions?.map((c) => (
+            <div key={c.expenseId} className="tiny muted">
+              지출 환전: {c.date} {c.need.amount} {c.need.asset} ← 오늘 {Number(c.pay.amount).toLocaleString()} TRX를 환전해 보유 ({c.route}) · 이 환전은 계획 실행과 별도로 직접 진행해야 합니다
+            </div>
+          ))}
           <div className="plan-grid">
             {cardPlans.map((p) => (
               <PlanCard
